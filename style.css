@@ -16,12 +16,12 @@ body {
 
 form {
 	position: relative;
-	width: 50%;
+	width: 315%;
 	margin: 0 auto;
 	padding: 20px;
 	border-top: 30px solid #5c5d5e;
 	border-radius: 10px;
-  background-color: #e8ebed;
+  background-color: #5c5d5e;
 	box-shadow: 0 0 80px rgba(0, 0, 0, .2);
 }
 
