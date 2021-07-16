@@ -1,5 +1,3 @@
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-
 <div class="noise"></div>
 <div class="overlay"></div>
 <div class="terminal">
@@ -7,131 +5,129 @@
   <p class="output">The page you are looking for could not be found.</p>
   
 <style>
-  body {
-  background-color: #222;
-  font-family: Arial, sans-serif;
+@import 'https://fonts.googleapis.com/css?family=Inconsolata';
+
+html {
+  min-height: 100%;
 }
 
-.tv-frame {
+body {
+  box-sizing: border-box;
+  height: 100%;
+  background-color: #000000;
+  background-image: radial-gradient(#11581E, #041607), url("https://media.giphy.com/media/oEI9uBYSzLpBK/giphy.gif");
+  background-repeat: no-repeat;
+  background-size: cover;
+  font-family: 'Inconsolata', Helvetica, sans-serif;
+  font-size: 1.5rem;
+  color: rgba(128, 255, 128, 0.8);
+  text-shadow:
+      0 0 1ex rgba(51, 255, 51, 1),
+      0 0 2px rgba(255, 255, 255, 0.8);
+}
+
+.noise {
+  pointer-events: none;
   position: absolute;
+  width: 100%;
+  height: 100%;
+  background-image: url("https://media.giphy.com/media/oEI9uBYSzLpBK/giphy.gif");
+  background-repeat: no-repeat;
+  background-size: cover;
+  z-index: -1;
+  opacity: .02;
+}
+
+.overlay {
+  pointer-events: none;
+  position: absolute;
+  width: 100%;
+  height: 100%;
+  background:
+      repeating-linear-gradient(
+      180deg,
+      rgba(0, 0, 0, 0) 0,
+      rgba(0, 0, 0, 0.3) 50%,
+      rgba(0, 0, 0, 0) 100%);
+  background-size: auto 4px;
+  z-index: 1;
+}
+
+.overlay::before {
+  content: "";
+  pointer-events: none;
+  position: absolute;
+  display: block;
+  top: 0;
   left: 0;
-  top: 50px;
   right: 0;
   bottom: 0;
-  width: 380px;
-  height: 220px;
-  box-sizing: border-box;
-  padding: 10px;
-  border-right: 80px solid #ad7443;
-  border-top: 30px solid #ad7443;
-  border-left: 30px solid #ad7443;
-  border-bottom: 30px solid #ad7443;
-  border-radius: 20px;
-  margin: auto;
-  background-image: linear-gradient(to bottom, rgba(255, 255, 255, 0.15), rgba(0, 0, 0, 0.45)), linear-gradient(to right bottom, rgba(255, 255, 255, 0), rgba(255, 255, 255, 0.15) 50%, rgba(255, 255, 255, 0) 50%, rgba(255, 255, 255, 0));
-  background-color: #666;
-  box-shadow: 0 0 50px rgba(255, 252, 234, 0.3), inset 0px 0px 30px rgba(255, 252, 234, 0.3);
-  animation: light .2s linear infinite;
+  width: 100%;
+  height: 100%;
+  background-image: linear-gradient(
+      0deg,
+      transparent 0%,
+      rgba(32, 128, 32, 0.2) 2%,
+      rgba(32, 128, 32, 0.8) 3%,
+      rgba(32, 128, 32, 0.2) 3%,
+      transparent 100%);
+  background-repeat: no-repeat;
+  animation: scan 7.5s linear 0s infinite;
 }
 
-.tv-frame::before {
+@keyframes scan {
+  0%        { background-position: 0 -100vh; }
+  35%, 100% { background-position: 0 100vh; }
+}
+
+.terminal {
+  box-sizing: inherit;
   position: absolute;
-  content: '404';
-  font-family: 'Bungee Inline';
-  text-shadow: 2px 2px #000;
-  width: 50px;
-  height: 20px;
-  left: 30px;
-  top: 20px;
-  font-size: 100px;
-  white-space: pre;
+  height: 100%;
+  width: 1000px;
+  max-width: 100%;
+  padding: 4rem;
+  text-transform: uppercase;
+}
+
+.output {
+  color: rgba(128, 255, 128, 0.8);
+  text-shadow:
+      0 0 1px rgba(51, 255, 51, 0.4),
+      0 0 2px rgba(255, 255, 255, 0.8);
+}
+
+.output::before {
+  content: "> ";
+}
+
+/*
+.input {
+  color: rgba(192, 255, 192, 0.8);
+  text-shadow:
+      0 0 1px rgba(51, 255, 51, 0.4),
+      0 0 2px rgba(255, 255, 255, 0.8);
+}
+
+.input::before {
+  content: "$ ";
+}
+*/
+
+a {
+  color: #fff;
+  text-decoration: none;
+}
+
+a::before {
+  content: "[";
+}
+
+a::after {
+  content: "]";
+}
+
+.errorcode {
   color: white;
-  opacity: 1;
-  animation: fade 1s linear infinite;
-}
-
-.tv-frame::after {
-  content: '__\A__\A__';
-  font-size: 40px;
-  font-weight: bold;
-  position: absolute;
-  color: #614126;
-  right: -60px;
-  top: 100px;
-  white-space: pre;
-  line-height: 10px;
-}
-
-.buttons {
-  position: absolute;
-  width: 30px;
-  right: -50px;
-}
-
-.buttons::before {
-  content: '⚇';
-  position: absolute;
-  color: #db9356;
-  font-size: 30px;
-  background-color: #614126;
-  border: 1px solid transparent;
-  border-radius: 30px;
-  top: 10px;
-}
-
-.buttons::after {
-  content: '⚇';
-  position: absolute;
-  color: #db9356;
-  font-size: 30px;
-  top: 60px;
-  left: 3px;
-  transform: rotate(60deg);
-  background-color: #614126;
-  border: 1px solid transparent;
-  border-radius: 30px;
-}
-
-.aerial {
-  position: absolute;
-  width: 100px;
-  height: 40px;
-  background-color: #db9356;
-  margin: auto;
-  top: -70px;
-  left: 80px;
-  border-top-left-radius: 50px;
-  border-top-right-radius: 50px;
-}
-
-.aerial::before {
-  content: '\|';
-  color: #614126;
-  font-size: 100px;
-  position: absolute;
-  top: -90px;
-  transform: rotate(-30deg);
-}
-
-.aerial::after {
-  content: '\|';
-  color: #614126;
-  font-size: 100px;
-  transform: rotate(30deg);
-  position: absolute;
-  top: -90px;
-  left: 75px;
-}
-
-@keyframes fade {
-  0%,100% { opacity: 0.5 }
-  50% { opacity: 0.7 }
-}
-
-@keyframes light {
-  
-  0%, 100% { opacity: 0.8 }
-  50% { opacity: 1 }
-  
 }
   </style>
