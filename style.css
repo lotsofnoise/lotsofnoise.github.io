@@ -15,8 +15,8 @@ body {
 }
 
 form {
-	position: center;
-	width: 315px;
+	position: relative;
+	width: 50%;
 	margin: 0 auto;
 	padding: 20px;
 	border-top: 30px solid #5c5d5e;
