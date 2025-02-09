@@ -1,2 +1,2 @@
 # lotsofnoise.github.io
-Smash 'n Dab
+Dab Smashers
