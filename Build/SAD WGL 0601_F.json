@@ -1,0 +1,13 @@
+{
+"companyName": "DefaultCompany",
+"productName": "SMASH N DAB",
+"dataUrl": "SAD WGL 0601_F.data.unityweb",
+"asmCodeUrl": "SAD WGL 0601_F.asm.code.unityweb",
+"asmMemoryUrl": "SAD WGL 0601_F.asm.memory.unityweb",
+"asmFrameworkUrl": "SAD WGL 0601_F.asm.framework.unityweb",
+"TOTAL_MEMORY": 268435456,
+"graphicsAPI": ["WebGL 2.0", "WebGL 1.0"],
+"webglContextAttributes": {"preserveDrawingBuffer": false},
+"splashScreenStyle": "Dark",
+"backgroundColor": "#231F20"
+}
