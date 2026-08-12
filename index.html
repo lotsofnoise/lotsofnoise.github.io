@@ -83,6 +83,14 @@
   }
   #recordBtn.recording::after { border-radius:6px; inset:20px; }
   #recordBtn.recording { border-color:#ff3b30; }
+  #zoomModeBtn {
+    width:72px; padding:8px 0; border-radius:16px;
+    background:rgba(0,0,0,0.45); color:#ffcc00;
+    border:1px solid rgba(255,204,0,0.5);
+    font-size:11px; font-weight:700; letter-spacing:1px;
+  }
+  #zoomModeBtn.auto { color:#7fd4ff; border-color:rgba(127,212,255,0.5); }
+  #bottomSpacer { width:72px; } /* mirrors the toggle so the record button stays centered */
   #recStatus {
     position:absolute; top:calc(env(safe-area-inset-top, 20px) + 44px);
     left:50%; transform:translateX(-50%);
@@ -106,7 +114,9 @@
     <div id="tiltReadout">0.0°</div>
     <div id="recStatus"><span id="recDot"></span>REC <span id="recTime">00:00</span></div>
     <div id="bottomBar">
+      <button id="zoomModeBtn" aria-label="Zoom mode">LOCKED</button>
       <button id="recordBtn" aria-label="Record"></button>
+      <div id="bottomSpacer"></div>
     </div>
   </div>
 
@@ -169,12 +179,48 @@
   let gravInit = false; // becomes true after the first sensor reading seeds the filter
 
   // *** MAIN TUNING KNOB ***
-  // How much of each new sensor reading is blended in per event.
-  //   Lower  (e.g. 0.05) = steadier, more "locked/still" like the real app,
-  //                        but slower to catch up to fast rotation.
-  //   Higher (e.g. 0.25) = snappier response, but more jitter during motion.
-  // Start here and adjust to taste on your device.
+  // How much of each new accelerometer reading is blended in per event.
+  // With gyro fusion active this only anchors the absolute level reference,
+  // so it can stay heavy (steady) without making rotation feel laggy.
   const GRAVITY_SMOOTHING = 0.1;
+
+  // --- GYRO FUSION (the "gimbal feel") --------------------------------------
+  // A complementary filter: the gyroscope's rotationRate is integrated for
+  // instant, motion-noise-free response (this is what a physical gimbal
+  // does), while the accelerometer's gravity direction gently corrects the
+  // slow drift that pure integration accumulates. Gyro = fast + drifty,
+  // accel = slow + absolute; blended, they give fast + absolute.
+  let fusedRoll = 0;          // device-frame fused roll (radians)
+  let fusedInit = false;
+  let lastMotionT = 0;        // ms timestamp of previous devicemotion event
+
+  // How strongly the accelerometer pulls the fused angle back per event.
+  // Small = trust the gyro (steadier during motion); large = trust the
+  // accelerometer (faster drift correction). ~0.02 at 60Hz ≈ ~1s correction.
+  const ACCEL_CORRECTION = 0.02;
+
+  // Gyro direction self-calibration. The sign convention of rotationRate
+  // varies across platforms, and integrating with the wrong sign would make
+  // the horizon fight the rotation instead of cancelling it. Instead of
+  // guessing, the code correlates the gyro rate against the accelerometer
+  // roll velocity during the user's first movements: consistent agreement
+  // fixes the sign. Until calibrated, the filter runs accelerometer-only
+  // (the previous behavior), so nothing breaks in the meantime.
+  let gyroSign = 0;           // 0 = not yet calibrated
+  let gyroScore = 0;
+  let prevARoll = null;
+  const GYRO_SCORE_NEEDED = 8;
+
+  // --- ZOOM MODE -------------------------------------------------------------
+  // 'locked'  = constant zoom (default): the image ONLY rotates, never
+  //             scales — the steady, gimbal-like look, at the cost of a
+  //             permanently tighter crop.
+  // 'dynamic' = zoom breathes with the angle for maximum field of view at
+  //             every tilt (what the previous version did).
+  let zoomLocked = true;
+  let lockedZoomAspect = 0;   // srcAspect the cached locked value was computed for
+  let lockedZoomValue = 1;
+  let prevSrcAspect = 0;      // for detecting camera-buffer orientation swaps
 
   // --- GRAVITY SIGN AUTO-CALIBRATION (fixes the upside-down recording) -----
   // Platforms disagree on the sign convention of accelerationIncludingGravity,
@@ -398,19 +444,13 @@
   }
 
   function computeTargetRoll() {
-    // Hold steady until the filter has been seeded by the first real reading.
-    if (!gravInit) return smoothedRoll;
+    // Hold steady until the sensors have been seeded.
+    if (!gravInit || !fusedInit) return smoothedRoll;
 
-    // atan2 of the (now filtered) gravity vector's screen-plane components.
-    // Continuous through a full 360° rotation with no discontinuities.
-    let roll = Math.atan2(gravX, gravY) * ROLL_SIGN;
-
-    // Compensate for the physical screen rotation (portrait vs landscape,
-    // and landscape-left vs landscape-right) so the correction is always
-    // relative to how the user is actually viewing the screen.
-    roll -= getScreenAngleDeg() * DEG2RAD;
-
-    return roll;
+    // The fused (gyro+accel) device-frame roll, compensated for the current
+    // screen rotation so the correction is relative to how the user is
+    // viewing the screen.
+    return fusedRoll - getScreenAngleDeg() * DEG2RAD;
   }
 
   // Shortest-path angle interpolation. A naive lerp between e.g. +179° and
@@ -427,6 +467,10 @@
     const g = evt.accelerationIncludingGravity;
     if (!g || g.x === null || g.y === null) return;
 
+    const now = performance.now();
+    const dt = lastMotionT ? Math.min((now - lastMotionT) / 1000, 0.1) : 0;
+    lastMotionT = now;
+
     // Apply the (auto-calibrated) platform sign correction at the source so
     // all downstream math works in one consistent convention.
     const gx = g.x * gravitySign;
@@ -441,11 +485,56 @@
       return;
     }
 
-    // Low-pass filter: blend in only a fraction of each new reading. Steady
-    // gravity accumulates; brief motion spikes from panning/turning the
-    // camera average out to near-zero and never reach the horizon math.
+    // Low-pass gravity filter (anchors the absolute level reference).
     gravX += (gx - gravX) * GRAVITY_SMOOTHING;
     gravY += (gy - gravY) * GRAVITY_SMOOTHING;
+
+    // Accelerometer-derived roll, in the DEVICE frame (screen-rotation
+    // compensation is applied later, at render time — the gyro measures
+    // device-frame rotation, so fusion must happen in the device frame too).
+    const aRoll = Math.atan2(gravX, gravY) * ROLL_SIGN;
+
+    if (!fusedInit) {
+      fusedRoll = aRoll;
+      fusedInit = true;
+      prevARoll = aRoll;
+      return;
+    }
+
+    // Gyro rate about the screen normal (device z-axis) in deg/s.
+    const rr = evt.rotationRate;
+    const rate = (rr && rr.alpha !== null && rr.alpha !== undefined) ? rr.alpha : null;
+
+    // --- Gyro direction self-calibration --------------------------------
+    // Correlate gyro rate against the accelerometer roll velocity during
+    // clear rotation. Consistent agreement (or disagreement) over several
+    // samples fixes the integration sign for this device.
+    if (gyroSign === 0 && rate !== null && dt > 0 && prevARoll !== null) {
+      let dA = aRoll - prevARoll;
+      while (dA > Math.PI)  dA -= 2 * Math.PI;
+      while (dA < -Math.PI) dA += 2 * Math.PI;
+      const aVel = dA / dt; // rad/s from the accelerometer's perspective
+      if (Math.abs(rate) > 30 && Math.abs(aVel) > 0.25) {
+        gyroScore += Math.sign(rate) * Math.sign(aVel);
+        if (Math.abs(gyroScore) >= GYRO_SCORE_NEEDED) {
+          gyroSign = gyroScore > 0 ? 1 : -1;
+        }
+      }
+    }
+    prevARoll = aRoll;
+
+    if (gyroSign !== 0 && rate !== null && dt > 0) {
+      // --- Complementary filter (calibrated path) ----------------------
+      // Integrate the gyro for instant response, then gently pull toward
+      // the accelerometer's absolute reading to cancel drift.
+      fusedRoll += gyroSign * ROLL_SIGN * rate * DEG2RAD * dt;
+      fusedRoll = lerpAngle(fusedRoll, aRoll, ACCEL_CORRECTION);
+    } else {
+      // --- Accelerometer-only fallback ----------------------------------
+      // Runs until the gyro direction is learned (or if this device
+      // provides no rotationRate at all).
+      fusedRoll = lerpAngle(fusedRoll, aRoll, 0.35);
+    }
   }
 
   // =========================================================================
@@ -520,13 +609,20 @@
     // Skip if the phone is lying nearly flat (in-plane gravity too weak to
     // judge orientation reliably); try again next frame.
     if (Math.hypot(gravX, gravY) < 4.0) return;
-    const roll = computeTargetRoll();
-    if (Math.cos(roll) < 0) {
+    const roll = fusedInit ? fusedRoll : Math.atan2(gravX, gravY) * ROLL_SIGN;
+    const compensated = roll - getScreenAngleDeg() * DEG2RAD;
+    if (Math.cos(compensated) < 0) {
       // Computed roll is closer to 180° than 0° while the user is holding
       // the phone normally -> this platform's gravity sign is inverted.
       gravitySign = -1;
       gravX = -gravX;
       gravY = -gravY;
+      // The absolute reference just flipped by 180°: resync the fused angle
+      // and restart the gyro direction calibration against the new reference.
+      fusedRoll = Math.atan2(gravX, gravY) * ROLL_SIGN;
+      prevARoll = fusedRoll;
+      gyroScore = 0;
+      gyroSign = 0;
     }
     signCalibrated = true;
   }
@@ -545,22 +641,48 @@
       const target = computeTargetRoll();
       smoothedRoll = lerpAngle(smoothedRoll, target, 0.5);
 
-      // --- Dynamic cover-zoom -------------------------------------------
-      // Minimal zoom such that the level landscape output rect (OUT_ASPECT x 1)
-      // rotated by smoothedRoll fits entirely inside the camera buffer
-      // (srcAspect x 1). Continuous in the angle -> the zoom breathes
-      // smoothly as the phone rotates: ~1x level in landscape, zooming in
-      // toward portrait. The tiny 1.002 margin avoids edge-pixel bleed.
+      // --- Zoom -----------------------------------------------------------
       const srcAspect = video.videoWidth / video.videoHeight;
-      const ac = Math.abs(Math.cos(smoothedRoll));
-      const as = Math.abs(Math.sin(smoothedRoll));
-      const coverScale = Math.max(
-        (OUT_ASPECT * ac + as) / srcAspect,
-        (OUT_ASPECT * as + ac)
-      ) * 1.002;
-      // Light extra smoothing hides the one-frame jump if the browser swaps
-      // the camera buffer orientation (portrait<->landscape) mid-rotation.
-      smoothedScale += (coverScale - smoothedScale) * 0.25;
+      let targetScale;
+      if (zoomLocked) {
+        // LOCKED (default): one constant zoom — the worst-case cover zoom
+        // across ALL angles for the current camera buffer. The image only
+        // ever rotates, never scales: the steady, gimbal-like look.
+        if (Math.abs(lockedZoomAspect - srcAspect) > 1e-3) {
+          let m = 0;
+          for (let d = 0; d <= 90; d++) {
+            const r2 = d * DEG2RAD;
+            const c2 = Math.abs(Math.cos(r2));
+            const s2 = Math.abs(Math.sin(r2));
+            m = Math.max(m, Math.max((OUT_ASPECT * c2 + s2) / srcAspect, OUT_ASPECT * s2 + c2));
+          }
+          lockedZoomValue = m * 1.002;
+          lockedZoomAspect = srcAspect;
+        }
+        targetScale = lockedZoomValue;
+      } else {
+        // DYNAMIC: minimal cover zoom for the current angle — maximum field
+        // of view at every tilt, at the cost of visible zoom "breathing".
+        const ac = Math.abs(Math.cos(smoothedRoll));
+        const as = Math.abs(Math.sin(smoothedRoll));
+        targetScale = Math.max(
+          (OUT_ASPECT * ac + as) / srcAspect,
+          (OUT_ASPECT * as + ac)
+        ) * 1.002;
+      }
+
+      // --- Camera-buffer orientation swap resync ---------------------------
+      // When the browser rotates the camera buffer (portrait<->landscape),
+      // the content, srcAspect, and screen angle all jump in the same
+      // instant. Snapping the smoothed values to their targets on that frame
+      // collapses what would be a multi-frame wobble into a single frame.
+      if (prevSrcAspect > 0 && Math.abs(srcAspect - prevSrcAspect) > 0.2) {
+        smoothedRoll = computeTargetRoll();
+        smoothedScale = targetScale;
+      }
+      prevSrcAspect = srcAspect;
+
+      smoothedScale += (targetScale - smoothedScale) * 0.25;
 
       gl.uniform1f(uRotationLoc, smoothedRoll);
       gl.uniform1f(uScaleLoc, smoothedScale);
@@ -693,6 +815,16 @@
     } else {
       startRecording();
     }
+  });
+
+  // Zoom mode toggle: LOCKED (constant zoom, image only rotates — steady,
+  // gimbal-like, default) <-> AUTO (dynamic zoom, maximum field of view,
+  // visible breathing as the angle changes).
+  const zoomModeBtn = document.getElementById('zoomModeBtn');
+  zoomModeBtn.addEventListener('click', function () {
+    zoomLocked = !zoomLocked;
+    zoomModeBtn.textContent = zoomLocked ? 'LOCKED' : 'AUTO';
+    zoomModeBtn.classList.toggle('auto', !zoomLocked);
   });
 
 })();
