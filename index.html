@@ -27,6 +27,19 @@
     touch-action:none;
   }
 
+  /* Hidden element whose padding mirrors the safe-area insets; the computed
+     values shift when the UI rotates (notched iPhones have mirrored insets
+     in the two landscapes), giving an orientation signal that works even
+     when every orientation API is frozen (iOS standalone quirk). */
+  #safeProbe {
+    position:fixed; top:0; left:0; width:0; height:0;
+    visibility:hidden; pointer-events:none;
+    padding-top:env(safe-area-inset-top, 0px);
+    padding-left:env(safe-area-inset-left, 0px);
+    padding-right:env(safe-area-inset-right, 0px);
+    padding-bottom:env(safe-area-inset-bottom, 0px);
+  }
+
   /* Hidden <video> element — used purely as a WebGL texture source, never shown directly */
   #srcVideo { position:absolute; width:1px; height:1px; opacity:0; pointer-events:none; }
 
@@ -109,6 +122,11 @@
 </style>
 </head>
 <body>
+
+  <!-- Hidden probe: its env() paddings change whenever iOS rotates the UI —
+       including 180° landscape flips that no orientation API reports in
+       standalone (home-screen) mode. Polled as an orientation-change signal. -->
+  <div id="safeProbe" aria-hidden="true"></div>
 
   <!-- Camera feed source (invisible, feeds pixels into the WebGL texture) -->
   <video id="srcVideo" playsinline muted autoplay></video>
@@ -728,6 +746,45 @@
   window.addEventListener('resize', layoutPreview);
   layoutPreview();
 
+  // --- Polled orientation-signature detector -------------------------------
+  // The events above are unreliable in iOS standalone (home-screen) mode —
+  // most damagingly for 180° landscape-to-landscape flips, where the camera
+  // buffer silently rotates but the aspect, the viewport, AND the events all
+  // stay unchanged, leaving the gravity anchor stale by 180° (the
+  // upside-down-when-sideways recording bug). So a signature of several
+  // orientation signals is polled a few times per second; the API values are
+  // still never trusted — ANY change in the signature merely triggers the
+  // gravity re-anchor, which supplies the correct value. The safe-area
+  // insets are the key ingredient: notched iPhones have mirrored insets in
+  // the two landscapes, so a 180° flip changes the signature even when every
+  // orientation API is frozen.
+  const safeProbe = document.getElementById('safeProbe');
+  const ORIENT_POLL_MS = 250;
+  let lastOrientPoll = 0;
+  let lastOrientSignature = null;
+
+  function orientationSignature() {
+    const cs = getComputedStyle(safeProbe);
+    const angle = (screen.orientation && typeof screen.orientation.angle === 'number')
+      ? screen.orientation.angle
+      : (typeof window.orientation === 'number' ? window.orientation : 'na');
+    const portraitish = window.innerHeight >= window.innerWidth ? 'P' : 'L';
+    return angle + '|' + portraitish + '|' +
+           cs.paddingTop + '|' + cs.paddingLeft + '|' + cs.paddingRight;
+  }
+
+  function pollOrientation(nowMs) {
+    if (nowMs - lastOrientPoll < ORIENT_POLL_MS) return;
+    lastOrientPoll = nowMs;
+    const sig = orientationSignature();
+    if (lastOrientSignature === null) {
+      lastOrientSignature = sig; // first sample: baseline only, no trigger
+    } else if (sig !== lastOrientSignature) {
+      lastOrientSignature = sig;
+      onOsRotation();
+    }
+  }
+
   // One-time gravity sign calibration (see the explanation at gravitySign).
   // Runs on the first frame with a strong-enough in-plane gravity reading;
   // requires the phone to be held roughly screen-toward-user, which is
@@ -773,6 +830,10 @@
       // happens on the gravity input (GRAVITY_SMOOTHING); this final lerp
       // is light, just to smooth the RAF/sensor timing mismatch.
       const nowMs = performance.now();
+
+      // Detect OS rotations that fired no event (iOS standalone quirk) —
+      // most importantly silent 180° landscape flips.
+      pollOrientation(nowMs);
 
       // Recompute the horizon-lock rotation every frame — EXCEPT during the
       // brief window right after an OS rotation, when the screen angle and
