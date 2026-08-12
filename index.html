@@ -19,7 +19,7 @@
 <link rel="icon" type="image/png" sizes="192x192" href="icons/icon-192.png">
 
 <style>
-  /* ---------- BASE RESET ---------- -->
+  /* ---------- BASE RESET ---------- */
   * { margin:0; padding:0; box-sizing:border-box; -webkit-user-select:none; user-select:none; -webkit-tap-highlight-color:transparent; }
   html, body {
     width:100%; height:100%; overflow:hidden;
@@ -30,15 +30,14 @@
   /* Hidden <video> element — used purely as a WebGL texture source, never shown directly */
   #srcVideo { position:absolute; width:1px; height:1px; opacity:0; pointer-events:none; }
 
-  /* The visible output — a FIXED landscape (16:9) frame, letterboxed on
-     portrait screens exactly like the real Horizon app's portrait view */
+  /* The visible output — a FIXED landscape (16:9) frame */
   #glCanvas {
     position:fixed; top:50%; left:50%;
     display:block; background:#000;
     transform-origin:center center;
   }
 
-  /* ---------- PERMISSION / START OVERLAY ---------- -->
+  /* ---------- PERMISSION / START OVERLAY ---------- */
   #startOverlay {
     position:fixed; inset:0; z-index:50;
     background:rgba(0,0,0,0.92);
@@ -60,7 +59,7 @@
   }
   #installHint.show { display:block; }
 
-  /* ---------- ON-SCREEN HUD ---------- -->
+  /* ---------- ON-SCREEN HUD ---------- */
   #hud {
     position:fixed; inset:0; z-index:10; pointer-events:none;
     display:flex; flex-direction:column; justify-content:space-between;
@@ -444,7 +443,6 @@
       gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, video);
 
       const target = computeTargetRoll();
-      // Heavily damped interpolation (0.25) to prevent any snappy jumps or flipping artifacts
       smoothedRoll = lerpAngle(smoothedRoll, target, 0.25);
 
       const srcAspect = video.videoWidth / video.videoHeight;
@@ -471,9 +469,7 @@
         ) * 1.002;
       }
 
-      // Removed the hard-snap resync on aspect change so it transitions smoothly instead of glitching/flipping
       prevSrcAspect = srcAspect;
-
       smoothedScale += (targetScale - smoothedScale) * 0.25;
 
       gl.uniform1f(uRotationLoc, smoothedRoll);
@@ -491,29 +487,66 @@
     requestAnimationFrame(renderLoop);
   }
 
+  // --- ROTATE-TO-FILL PREVIEW (Display only; recording buffer is untouched) ---
+  let previewQuadrant = 0;      
+  let previewCssRotation = 0;   
+  const PREVIEW_HYSTERESIS = 18; 
+
   function previewFit() {
     const vw = window.innerWidth;
     const vh = window.innerHeight;
     const wUp = Math.min(vw, vh * OUT_ASPECT);
     const hUp = wUp / OUT_ASPECT;
-    return { wUp: wUp, hUp: hUp };
+    const sideways = Math.max(vw / hUp, vh / wUp);
+    return { wUp: wUp, hUp: hUp, sideways: sideways };
   }
 
-  function applyPreview() {
+  function applyPreview(rotDeg, scale, animate) {
     const f = previewFit();
     canvas.style.width  = f.wUp + 'px';
     canvas.style.height = f.hUp + 'px';
-    canvas.style.transform = 'translate(-50%,-50%)';
+    const end = 'translate(-50%,-50%) rotate(' + rotDeg + 'deg) scale(' + scale + ')';
+    if (animate) {
+      const midScale = Math.max(scale, canvas._lastScale || 1) * 1.25;
+      const midRot = ((canvas._lastRot || 0) + rotDeg) / 2;
+      canvas.animate(
+        [
+          { transform: 'translate(-50%,-50%) rotate(' + (canvas._lastRot || 0) + 'deg) scale(' + (canvas._lastScale || 1) + ')' },
+          { transform: 'translate(-50%,-50%) rotate(' + midRot + 'deg) scale(' + midScale + ')', offset: 0.5 },
+          { transform: end }
+        ],
+        { duration: 420, easing: 'ease-in-out', fill: 'none' }
+      );
+    }
+    canvas.style.transform = end;
+    canvas._lastRot = rotDeg;
+    canvas._lastScale = scale;
   }
 
   function updatePreview() {
-    applyPreview();
+    if (!fusedInit) { applyPreview(0, 1, false); return; }
+
+    const physical = fusedRoll * 180 / Math.PI;
+    const rel = ((physical - previewQuadrant) % 360 + 540) % 360 - 180;
+
+    if (Math.abs(rel) > 45 + PREVIEW_HYSTERESIS) {
+      const q = ((Math.round(physical / 90) * 90) % 360 + 360) % 360;
+      const targetCss = q;
+      let delta = ((targetCss - previewCssRotation) % 360 + 540) % 360 - 180;
+      previewCssRotation += delta;
+      previewQuadrant = q;
+      const sideways = (q === 90 || q === 270);
+      const f = previewFit();
+      applyPreview(previewCssRotation, sideways ? f.sideways : 1, true);
+    }
   }
 
   window.addEventListener('resize', function () {
-    applyPreview();
+    const sideways = (previewQuadrant === 90 || previewQuadrant === 270);
+    const f = previewFit();
+    applyPreview(previewCssRotation, sideways ? f.sideways : 1, false);
   });
-  applyPreview();
+  applyPreview(0, 1, false);
 
   function pickSupportedMimeType() {
     const candidates = [
