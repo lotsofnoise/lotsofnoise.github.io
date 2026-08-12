@@ -94,7 +94,13 @@
     font-size:11px; font-weight:700; letter-spacing:1px;
   }
   #zoomModeBtn.auto { color:#7fd4ff; border-color:rgba(127,212,255,0.5); }
-  #bottomSpacer { width:72px; } /* mirrors the toggle so the record button stays centered */
+  #compBtn {
+    width:72px; padding:8px 0; border-radius:16px;
+    background:rgba(0,0,0,0.45); color:#8f8;
+    border:1px solid rgba(136,255,136,0.5);
+    font-size:11px; font-weight:700; letter-spacing:1px;
+  }
+  #compBtn.screen { color:#ffb27f; border-color:rgba(255,178,127,0.6); }
   #recStatus {
     position:absolute; top:calc(env(safe-area-inset-top, 20px) + 44px);
     left:50%; transform:translateX(-50%);
@@ -120,7 +126,7 @@
     <div id="bottomBar">
       <button id="zoomModeBtn" aria-label="Zoom mode">AUTO</button>
       <button id="recordBtn" aria-label="Record"></button>
-      <div id="bottomSpacer"></div>
+      <button id="compBtn" aria-label="Orientation compensation">GRAVITY</button>
     </div>
   </div>
 
@@ -253,6 +259,12 @@
   // Smoothed rotation actually sent to the GPU (radians). Smoothing prevents
   // jittery, noisy sensor data from causing a shaky/flickering horizon.
   let smoothedRoll = 0;
+
+  // false = level purely to gravity (default; fixes sideways upside-down).
+  // true  = also subtract the browser's screen angle (only correct if the OS
+  //         rotates the camera buffer, i.e. rotation unlocked). Toggled by the
+  //         COMPENSATE button.
+  let useScreenCompensation = false;
 
   // Smoothed dynamic zoom. The raw cover-zoom is already a continuous
   // function of the roll angle; this light smoothing additionally hides the
@@ -451,10 +463,21 @@
     // Hold steady until the sensors have been seeded.
     if (!gravInit || !fusedInit) return smoothedRoll;
 
-    // The fused (gyro+accel) device-frame roll, compensated for the current
-    // screen rotation so the correction is relative to how the user is
-    // viewing the screen.
-    return fusedRoll - getScreenAngleDeg() * DEG2RAD;
+    // GRAVITY-ONLY leveling (default). fusedRoll comes straight from gravity,
+    // which is unambiguous through a full 360° turn, so "up" in the output
+    // always points away from gravity — it can't record upside-down no matter
+    // what the browser reports for screen orientation. This is the fix for the
+    // sideways/upside-down recording.
+    //
+    // The old behavior subtracted getScreenAngleDeg(); that value is
+    // unreliable for a home-screen web app in landscape (often 180° wrong),
+    // which was the bug. It's only needed if the OS itself rotates the camera
+    // buffer (rotation unlocked). If you ever hit an orientation that's wrong,
+    // the on-screen COMPENSATE button flips this back on.
+    if (useScreenCompensation) {
+      return fusedRoll - getScreenAngleDeg() * DEG2RAD;
+    }
+    return fusedRoll;
   }
 
   // Shortest-path angle interpolation. A naive lerp between e.g. +179° and
@@ -614,7 +637,7 @@
     // judge orientation reliably); try again next frame.
     if (Math.hypot(gravX, gravY) < 4.0) return;
     const roll = fusedInit ? fusedRoll : Math.atan2(gravX, gravY) * ROLL_SIGN;
-    const compensated = roll - getScreenAngleDeg() * DEG2RAD;
+    const compensated = useScreenCompensation ? (roll - getScreenAngleDeg() * DEG2RAD) : roll;
     if (Math.cos(compensated) < 0) {
       // Computed roll is closer to 180° than 0° while the user is holding
       // the phone normally -> this platform's gravity sign is inverted.
@@ -870,6 +893,22 @@
     zoomLocked = !zoomLocked;
     zoomModeBtn.textContent = zoomLocked ? 'LOCKED' : 'AUTO';
     zoomModeBtn.classList.toggle('auto', !zoomLocked);
+  });
+
+  // Orientation mode toggle:
+  //   GRAVITY (default) = level purely to gravity; fixes sideways/upside-down.
+  //   SCREEN            = also subtract the browser screen angle (only right
+  //                       if the OS rotates the camera buffer / rotation
+  //                       unlocked). Provided so you're never stuck if your
+  //                       device happens to need it.
+  const compBtn = document.getElementById('compBtn');
+  compBtn.addEventListener('click', function () {
+    useScreenCompensation = !useScreenCompensation;
+    compBtn.textContent = useScreenCompensation ? 'SCREEN' : 'GRAVITY';
+    compBtn.classList.toggle('screen', useScreenCompensation);
+    // Re-run the one-time gravity sign calibration under the new mode so the
+    // up/down reference is correct for whichever leveling is active.
+    signCalibrated = false;
   });
 
 })();
