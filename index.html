@@ -94,13 +94,6 @@
     font-size:11px; font-weight:700; letter-spacing:1px;
   }
   #zoomModeBtn.auto { color:#7fd4ff; border-color:rgba(127,212,255,0.5); }
-  #compBtn {
-    width:72px; padding:8px 0; border-radius:16px;
-    background:rgba(0,0,0,0.45); color:#8f8;
-    border:1px solid rgba(136,255,136,0.5);
-    font-size:11px; font-weight:700; letter-spacing:1px;
-  }
-  #compBtn.screen { color:#ffb27f; border-color:rgba(255,178,127,0.6); }
   #recStatus {
     position:absolute; top:calc(env(safe-area-inset-top, 20px) + 44px);
     left:50%; transform:translateX(-50%);
@@ -126,7 +119,6 @@
     <div id="bottomBar">
       <button id="zoomModeBtn" aria-label="Zoom mode">AUTO</button>
       <button id="recordBtn" aria-label="Record"></button>
-      <button id="compBtn" aria-label="Flip rotation direction">FLIP</button>
     </div>
   </div>
 
@@ -260,10 +252,9 @@
   // jittery, noisy sensor data from causing a shaky/flickering horizon.
   let smoothedRoll = 0;
 
-  // Direction of the horizon counter-rotation. -1 is the corrected default
-  // that keeps landscape upright on the common iOS sensor-sign; the FLIP
-  // button switches it if a given device is the opposite.
-  let rollDir = -1;
+  // Direction of the horizon counter-rotation. +1 is the corrected default
+  // for this device (a landscape screenshot at 88° confirmed -1 rendered
+  // upside-down); the FLIP button switches it if ever needed.
 
   // Smoothed dynamic zoom. The raw cover-zoom is already a continuous
   // function of the roll angle; this light smoothing additionally hides the
@@ -462,20 +453,15 @@
     // Hold steady until the sensors have been seeded.
     if (!gravInit || !fusedInit) return smoothedRoll;
 
-    // Level purely to gravity. fusedRoll comes straight from gravity, which is
-    // unambiguous through a full 360° turn, so the browser's unreliable
-    // screen-angle number is never used.
-    //
-    // rollDir sets the direction of the counter-rotation. If the image comes
-    // out upside-down in landscape but fine in portrait, the direction is
-    // inverted for this device's sensor sign — the FLIP button toggles it.
-    // Flipping is safe for portrait (a ~0° tilt reversed is still ~0°).
-    return fusedRoll * rollDir;
+    // Level to gravity. The counter-rotation direction is the NEGATIVE of the
+    // gravity roll here: with the previous (positive) direction the image came
+    // out correct in portrait but upside-down in landscape, which is the exact
+    // signature of the rotation going the wrong way (the error is zero at 0°
+    // and a full half-turn at 90°). Negating fixes landscape while leaving
+    // portrait untouched (a ~0° tilt negated is still ~0°), and it's smooth —
+    // no flip, no discontinuity through the turn.
+    return -fusedRoll;
   }
-
-  // Kept for the calibration helper below; screen compensation is no longer
-  // part of the leveling path (gravity-only is used).
-  function getScreenAngleDegUnused() { return getScreenAngleDeg(); }
 
   // Shortest-path angle interpolation. A naive lerp between e.g. +179° and
   // -179° would spin the long way around; this always takes the short way,
@@ -890,22 +876,6 @@
     zoomLocked = !zoomLocked;
     zoomModeBtn.textContent = zoomLocked ? 'LOCKED' : 'AUTO';
     zoomModeBtn.classList.toggle('auto', !zoomLocked);
-  });
-
-  // Orientation mode toggle:
-  //   GRAVITY (default) = level purely to gravity; fixes sideways/upside-down.
-  //   SCREEN            = also subtract the browser screen angle (only right
-  //                       if the OS rotates the camera buffer / rotation
-  //                       unlocked). Provided so you're never stuck if your
-  //                       device happens to need it.
-  // FLIP: reverses the horizon counter-rotation direction. Use it if the
-  // image is upside-down in landscape — one tap. Portrait is unaffected.
-  const compBtn = document.getElementById('compBtn');
-  compBtn.addEventListener('click', function () {
-    rollDir = -rollDir;
-    compBtn.classList.toggle('screen', rollDir > 0);
-    // Snap so the change is immediate rather than sweeping 180° slowly.
-    smoothedRoll = computeTargetRoll();
   });
 
 })();
