@@ -9,7 +9,7 @@
 <link rel="manifest" href="manifest.json">
 <meta name="theme-color" content="#000000">
 
-<!-- iOS "Add to Home Screen" support -->
+<!-- iOS "Add to Home Screen" support (Safari ignores manifest.json for these) -->
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <meta name="apple-mobile-web-app-title" content="Horizon">
@@ -27,10 +27,11 @@
     touch-action:none;
   }
 
-  /* Hidden <video> element — texture source for WebGL */
+  /* Hidden <video> element — used purely as a WebGL texture source, never shown directly */
   #srcVideo { position:absolute; width:1px; height:1px; opacity:0; pointer-events:none; }
 
-  /* Canvas frame — fixed aspect, scaled and rotated via CSS preview transform */
+  /* The visible output — a FIXED landscape (16:9) frame, letterboxed on
+     portrait screens exactly like the real Horizon app's portrait view */
   #glCanvas {
     position:fixed; top:50%; left:50%;
     display:block; background:#000;
@@ -93,7 +94,7 @@
     font-size:11px; font-weight:700; letter-spacing:1px;
   }
   #zoomModeBtn.auto { color:#7fd4ff; border-color:rgba(127,212,255,0.5); }
-  #bottomSpacer { width:72px; }
+  #bottomSpacer { width:72px; } /* mirrors the toggle so the record button stays centered */
   #recStatus {
     position:absolute; top:calc(env(safe-area-inset-top, 20px) + 44px);
     left:50%; transform:translateX(-50%);
@@ -106,9 +107,13 @@
 </head>
 <body>
 
+  <!-- Camera feed source (invisible, feeds pixels into the WebGL texture) -->
   <video id="srcVideo" playsinline muted autoplay></video>
+
+  <!-- WebGL render target: this is what the user actually sees -->
   <canvas id="glCanvas"></canvas>
 
+  <!-- HUD overlay -->
   <div id="hud">
     <div id="tiltReadout">0.0°</div>
     <div id="recStatus"><span id="recDot"></span>REC <span id="recTime">00:00</span></div>
@@ -119,6 +124,7 @@
     </div>
   </div>
 
+  <!-- Start / permission-handshake overlay (required for iOS Safari motion sensors) -->
   <div id="startOverlay">
     <h1>Horizon Level Camera</h1>
     <p>Locks the video to true horizontal, no matter how the phone is rotated. Tap below to grant camera, microphone, and motion sensor access.</p>
@@ -131,6 +137,9 @@
 (function () {
   'use strict';
 
+  // =========================================================================
+  // 0. PWA: SERVICE WORKER REGISTRATION
+  // =========================================================================
   if ('serviceWorker' in navigator) {
     window.addEventListener('load', () => {
       navigator.serviceWorker.register('service-worker.js').catch((err) => {
@@ -145,6 +154,9 @@
     document.getElementById('installHint').classList.add('show');
   }
 
+  // =========================================================================
+  // 1. GLOBAL STATE
+  // =========================================================================
   const video   = document.getElementById('srcVideo');
   const canvas  = document.getElementById('glCanvas');
   const overlay = document.getElementById('startOverlay');
@@ -155,38 +167,42 @@
   const recTimeEl = document.getElementById('recTime');
   const tiltReadout = document.getElementById('tiltReadout');
 
-  const DEG2RAD = Math.PI / 180;
+  // New Global State for WYSIWYG Recording
+  const recCanvas = document.createElement('canvas');
+  let recCtx = null;
+  let REC_WIDTH = 1080;
+  let REC_HEIGHT = 1920;
 
+  const DEG2RAD = Math.PI / 180;
   let gravX = 0;
   let gravY = 0;
-  let gravInit = false;
-  const GRAVITY_SMOOTHING = 0.1;
+  let gravInit = false; 
 
-  let fusedRoll = 0;
+  const GRAVITY_SMOOTHING = 0.1;
+  let fusedRoll = 0;          
   let fusedInit = false;
-  let lastMotionT = 0;
+  let lastMotionT = 0;        
   const ACCEL_CORRECTION = 0.02;
 
-  let gyroSign = 0;
+  let gyroSign = 0;           
   let gyroScore = 0;
   let prevARoll = null;
   const GYRO_SCORE_NEEDED = 8;
 
   let zoomLocked = true;
-  let lockedZoomAspect = 0;
+  let lockedZoomAspect = 0;   
   let lockedZoomValue = 1;
-  let prevSrcAspect = 0;
+  let prevSrcAspect = 0;      
 
   let gravitySign = 1;
   let signCalibrated = false;
-
   const ROLL_SIGN = 1;
-  let motionListenerAttached = false;
 
+  let motionListenerAttached = false;
   let smoothedRoll = 0;
   let smoothedScale = 1;
 
-  let combinedStream = null;
+  let combinedStream = null;   
   let audioTrack = null;
   let mediaRecorder = null;
   let recordedChunks = [];
@@ -194,6 +210,9 @@
   let recStartTime = 0;
   let recTimerHandle = null;
 
+  // =========================================================================
+  // 2. WEBGL SETUP
+  // =========================================================================
   const gl = canvas.getContext('webgl', { antialias: false, preserveDrawingBuffer: false })
           || canvas.getContext('experimental-webgl');
 
@@ -203,8 +222,8 @@
   }
 
   const VERTEX_SRC = `
-    attribute vec2 aPosition;
-    attribute vec2 aTexCoord;
+    attribute vec2 aPosition;   
+    attribute vec2 aTexCoord;   
     varying vec2 vTexCoord;
     void main() {
       vTexCoord = aTexCoord;
@@ -217,10 +236,10 @@
     varying vec2 vTexCoord;
 
     uniform sampler2D uTexture;
-    uniform float uRotation;
-    uniform float uScale;
-    uniform float uOutAspect;
-    uniform float uSrcAspect;
+    uniform float uRotation;   
+    uniform float uScale;      
+    uniform float uOutAspect;  
+    uniform float uSrcAspect;  
 
     void main() {
       vec2 p = (vTexCoord - 0.5) * vec2(uOutAspect, 1.0);
@@ -300,6 +319,19 @@
   gl.viewport(0, 0, OUT_WIDTH, OUT_HEIGHT);
   gl.uniform1f(uOutAspectLoc, OUT_ASPECT);
 
+  // =========================================================================
+  // 3. INVERSION-SHIELD SENSOR MATH
+  // =========================================================================
+  function getScreenAngleDeg() {
+    if (screen.orientation && typeof screen.orientation.angle === 'number') {
+      return screen.orientation.angle;
+    }
+    if (typeof window.orientation === 'number') {
+      return (360 - window.orientation) % 360;
+    }
+    return 0;
+  }
+
   function computeTargetRoll() {
     if (!gravInit || !fusedInit) return smoothedRoll;
     return fusedRoll;
@@ -349,7 +381,7 @@
       let dA = aRoll - prevARoll;
       while (dA > Math.PI)  dA -= 2 * Math.PI;
       while (dA < -Math.PI) dA += 2 * Math.PI;
-      const aVel = dA / dt;
+      const aVel = dA / dt; 
       if (Math.abs(rate) > 30 && Math.abs(aVel) > 0.25) {
         gyroScore += Math.sign(rate) * Math.sign(aVel);
         if (Math.abs(gyroScore) >= GYRO_SCORE_NEEDED) {
@@ -367,12 +399,15 @@
     }
   }
 
+  // =========================================================================
+  // 4. PERMISSION HANDSHAKE
+  // =========================================================================
   async function requestMotionPermission() {
     if (typeof DeviceMotionEvent !== 'undefined' &&
         typeof DeviceMotionEvent.requestPermission === 'function') {
       const result = await DeviceMotionEvent.requestPermission();
       if (result !== 'granted') {
-        throw new Error('Motion sensor permission was denied.');
+        throw new Error('Motion sensor permission was denied. The horizon lock cannot function without it.');
       }
     }
     if (!motionListenerAttached) {
@@ -414,11 +449,15 @@
     }
   });
 
+  // =========================================================================
+  // 5. RENDER LOOP
+  // =========================================================================
   function calibrateGravitySign() {
     if (signCalibrated || !gravInit) return;
     if (Math.hypot(gravX, gravY) < 4.0) return;
     const roll = fusedInit ? fusedRoll : Math.atan2(gravX, gravY) * ROLL_SIGN;
-    if (Math.cos(roll) < 0) {
+    const compensated = roll;
+    if (Math.cos(compensated) < 0) {
       gravitySign = -1;
       gravX = -gravX;
       gravY = -gravY;
@@ -482,17 +521,45 @@
       tiltReadout.textContent = deg.toFixed(1) + '°';
 
       updatePreview();
+
+      // --- WYSIWYG RECORDING RENDER ---
+      // Replicate exact CSS transforms (scaling & rotation) from the visual output 
+      // onto a fixed 2D canvas strictly for MediaRecorder processing.
+      if (isRecording && recCtx) {
+        recCtx.fillStyle = '#000';
+        recCtx.fillRect(0, 0, REC_WIDTH, REC_HEIGHT);
+        recCtx.save();
+        recCtx.translate(REC_WIDTH / 2, REC_HEIGHT / 2);
+
+        const style = window.getComputedStyle(canvas);
+        let scale = 1;
+        let angle = 0;
+        
+        // Extract matrix from CSS engine to ensure pixel-perfect mid-animation sync
+        if (style.transform && style.transform !== 'none') {
+          const matrix = new DOMMatrix(style.transform);
+          scale = Math.sqrt(matrix.a * matrix.a + matrix.b * matrix.b);
+          angle = Math.atan2(matrix.b, matrix.a);
+        }
+        
+        recCtx.rotate(angle);
+
+        const f = previewFit();
+        const pxRatio = REC_WIDTH / window.innerWidth;
+        const drawW = f.wUp * scale * pxRatio;
+        const drawH = f.hUp * scale * pxRatio;
+
+        recCtx.drawImage(canvas, -drawW / 2, -drawH / 2, drawW, drawH);
+        recCtx.restore();
+      }
     }
 
     requestAnimationFrame(renderLoop);
   }
 
-  // =========================================================================
-  // PREVIEW ROTATION & FULLSCREEN FIT (DISPLAY ONLY)
-  // =========================================================================
-  let previewQuadrant = 0;
-  let previewCssRotation = 0;
-  const PREVIEW_HYSTERESIS = 18;
+  let previewQuadrant = 0;      
+  let previewCssRotation = 0;   
+  const PREVIEW_HYSTERESIS = 18; 
 
   function previewFit() {
     const vw = window.innerWidth;
@@ -508,7 +575,6 @@
     canvas.style.width  = f.wUp + 'px';
     canvas.style.height = f.hUp + 'px';
     const end = 'translate(-50%,-50%) rotate(' + rotDeg + 'deg) scale(' + scale + ')';
-
     if (animate) {
       const midScale = Math.max(scale, canvas._lastScale || 1) * 1.25;
       const midRot = ((canvas._lastRot || 0) + rotDeg) / 2;
@@ -534,8 +600,7 @@
 
     if (Math.abs(rel) > 45 + PREVIEW_HYSTERESIS) {
       const q = ((Math.round(physical / 90) * 90) % 360 + 360) % 360;
-      // Invert sign (-q) so canvas top aligns upright when held sideways
-      const targetCss = -q;
+      const targetCss = q;
       let delta = ((targetCss - previewCssRotation) % 360 + 540) % 360 - 180;
       previewCssRotation += delta;
       previewQuadrant = q;
@@ -552,11 +617,14 @@
   });
   applyPreview(0, 1, false);
 
+  // =========================================================================
+  // 6. LOCAL RECORDING ENGINE
+  // =========================================================================
   function pickSupportedMimeType() {
     const candidates = [
-      'video/mp4;codecs=avc1,mp4a.40.2',
+      'video/mp4;codecs=avc1,mp4a.40.2', 
       'video/mp4',
-      'video/webm;codecs=vp9,opus',
+      'video/webm;codecs=vp9,opus',      
       'video/webm;codecs=vp8,opus',
       'video/webm'
     ];
@@ -565,16 +633,29 @@
         return type;
       }
     }
-    return '';
+    return ''; 
+  }
+
+  function initRecCanvas() {
+    // Generate a fixed canvas size matching the exact screen aspect ratio dynamically
+    REC_WIDTH = 1080;
+    REC_HEIGHT = Math.round(REC_WIDTH * (window.innerHeight / window.innerWidth));
+    if (REC_HEIGHT % 2 !== 0) REC_HEIGHT += 1; // Encoders prefer even numbers
+    recCanvas.width = REC_WIDTH;
+    recCanvas.height = REC_HEIGHT;
+    recCtx = recCanvas.getContext('2d', { alpha: false });
   }
 
   function startRecording() {
-    if (!canvas.captureStream) {
+    initRecCanvas();
+
+    if (!recCanvas.captureStream) {
       fatalError('This browser does not support canvas.captureStream().');
       return;
     }
 
-    const canvasStream = canvas.captureStream(30);
+    // Capture the 2D replication of what the user literally sees
+    const canvasStream = recCanvas.captureStream(30);
     if (audioTrack) {
       canvasStream.addTrack(audioTrack);
     }
@@ -596,7 +677,7 @@
     };
     mediaRecorder.onstop = handleRecordingStop;
 
-    mediaRecorder.start(1000);
+    mediaRecorder.start(1000); 
     isRecording = true;
     recStartTime = Date.now();
     recordBtn.classList.add('recording');
