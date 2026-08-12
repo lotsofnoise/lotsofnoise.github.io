@@ -535,18 +535,13 @@
     }
     prevARoll = aRoll;
 
-    if (gyroSign !== 0 && rate !== null && dt > 0) {
-      // --- Complementary filter (calibrated path) ----------------------
-      // Integrate the gyro for instant response, then gently pull toward
-      // the accelerometer's absolute reading to cancel drift.
-      fusedRoll += gyroSign * ROLL_SIGN * rate * DEG2RAD * dt;
-      fusedRoll = lerpAngle(fusedRoll, aRoll, ACCEL_CORRECTION);
-    } else {
-      // --- Accelerometer-only fallback ----------------------------------
-      // Runs until the gyro direction is learned (or if this device
-      // provides no rotationRate at all).
-      fusedRoll = lerpAngle(fusedRoll, aRoll, 0.35);
-    }
+    // Level PURELY from gravity (accelerometer). aRoll is an absolute
+    // measurement of "down" every frame, so it cannot drift-and-snap the way
+    // gyro integration can — that drift-then-snap-back on rolls was the gyro
+    // briefly pushing the wrong way before the accelerometer corrected it.
+    // The adaptive smoothing in the render loop keeps this steady when still
+    // and responsive when you actually roll, so we don't need the gyro.
+    fusedRoll = aRoll;
   }
 
   // =========================================================================
@@ -648,11 +643,20 @@
       gl.bindTexture(gl.TEXTURE_2D, texture);
       gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, video);
 
-      // Recompute the horizon-lock rotation every frame. The heavy smoothing
-      // happens on the gravity input (GRAVITY_SMOOTHING); this final lerp
-      // is light, just to smooth the RAF/sensor timing mismatch.
+      // Recompute the horizon-lock rotation every frame, then smooth it
+      // ADAPTIVELY: when the phone is nearly still, the frame-to-frame change is
+      // just sensor noise, so smooth it hard (kills the jiggle); when you
+      // genuinely move, the change is large, so respond fast (kills the lag).
+      // A single fixed lerp can't do both — that's why it felt late AND jittery.
       const target = computeTargetRoll();
-      smoothedRoll = lerpAngle(smoothedRoll, target, 0.5);
+      let d = target - smoothedRoll;
+      while (d > Math.PI)  d -= 2 * Math.PI;
+      while (d < -Math.PI) d += 2 * Math.PI;
+      const moveDeg = Math.abs(d) * 180 / Math.PI;
+      // Gain floor 0.06 (very steady when still) rising with real motion up to
+      // 0.6 (snappy). Tune the 0.05 slope up for more responsiveness.
+      const gain = Math.min(0.6, 0.06 + moveDeg * 0.05);
+      smoothedRoll += d * gain;
 
       // --- Zoom -----------------------------------------------------------
       const srcAspect = video.videoWidth / video.videoHeight;
