@@ -776,9 +776,11 @@
 
     if (Math.abs(rel) > 45 + PREVIEW_HYSTERESIS) {
       const q = ((Math.round(physical / 90) * 90) % 360 + 360) % 360;
-      // Counter-rotate the preview so the (already-upright) content stays
-      // upright to you while filling the screen. Shortest arc.
-      const targetCss = -q;
+      // Rotate the preview the SAME direction as the physical turn so the
+      // (already-upright) content stays upright to you in landscape. (This
+      // direction was flipped from -q, which showed landscape upside-down on
+      // device — a display-only sign; the recording is unaffected either way.)
+      const targetCss = q;
       let delta = ((targetCss - previewCssRotation) % 360 + 540) % 360 - 180;
       previewCssRotation += delta;
       previewQuadrant = q;
