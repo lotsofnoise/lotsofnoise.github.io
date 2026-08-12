@@ -67,9 +67,10 @@
   }
   #tiltReadout {
     align-self:center; margin-top:env(safe-area-inset-top, 20px);
-    background:rgba(0,0,0,0.4); color:#ffcc00;
-    font-variant-numeric:tabular-nums; font-size:14px; font-weight:600;
-    padding:6px 16px; border-radius:20px; letter-spacing:1px;
+    background:rgba(0,0,0,0.55); color:#ffcc00;
+    font-variant-numeric:tabular-nums; font-size:11px; font-weight:600;
+    font-family:ui-monospace, Menlo, monospace;
+    padding:5px 10px; border-radius:14px; letter-spacing:0; max-width:96vw;
   }
   #bottomBar {
     display:flex; align-items:center; justify-content:center;
@@ -700,11 +701,20 @@
 
       gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
 
-      // HUD readout (degrees, 0.0 = perfectly level). If tilting the phone
-      // clockwise makes the image visibly rotate WITH the phone instead of
-      // counter-rotating to stay level, flip ROLL_SIGN above and reload.
+      // Live diagnostic readout — the real device values, so the orientation
+      // fix can be based on your hardware instead of assumptions. Reads:
+      //   g  = raw gravity vector (device frame)
+      //   f  = fused physical roll (deg)   scr = browser screen angle (deg)
+      //   buf = camera buffer WxH (tells us if the buffer is portrait/landscape)
       const deg = (-smoothedRoll * 180 / Math.PI);
-      tiltReadout.textContent = deg.toFixed(1) + '°';
+      const scrAng = (screen.orientation && typeof screen.orientation.angle === 'number')
+        ? screen.orientation.angle
+        : (typeof window.orientation === 'number' ? window.orientation : '?');
+      tiltReadout.textContent =
+        'g ' + gravX.toFixed(1) + ',' + gravY.toFixed(1) +
+        '  f ' + (fusedRoll * 180 / Math.PI).toFixed(0) + '°' +
+        '  scr ' + scrAng +
+        '  buf ' + video.videoWidth + 'x' + video.videoHeight;
 
       // --- PREVIEW ROTATION (display only — does NOT touch the recording) ---
       // The recorded canvas is already correct in every orientation. This
