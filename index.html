@@ -126,7 +126,7 @@
     <div id="bottomBar">
       <button id="zoomModeBtn" aria-label="Zoom mode">AUTO</button>
       <button id="recordBtn" aria-label="Record"></button>
-      <button id="compBtn" aria-label="Orientation compensation">GRAVITY</button>
+      <button id="compBtn" aria-label="Flip rotation direction">FLIP</button>
     </div>
   </div>
 
@@ -260,11 +260,10 @@
   // jittery, noisy sensor data from causing a shaky/flickering horizon.
   let smoothedRoll = 0;
 
-  // false = level purely to gravity (default; fixes sideways upside-down).
-  // true  = also subtract the browser's screen angle (only correct if the OS
-  //         rotates the camera buffer, i.e. rotation unlocked). Toggled by the
-  //         COMPENSATE button.
-  let useScreenCompensation = false;
+  // Direction of the horizon counter-rotation. -1 is the corrected default
+  // that keeps landscape upright on the common iOS sensor-sign; the FLIP
+  // button switches it if a given device is the opposite.
+  let rollDir = -1;
 
   // Smoothed dynamic zoom. The raw cover-zoom is already a continuous
   // function of the roll angle; this light smoothing additionally hides the
@@ -463,22 +462,20 @@
     // Hold steady until the sensors have been seeded.
     if (!gravInit || !fusedInit) return smoothedRoll;
 
-    // GRAVITY-ONLY leveling (default). fusedRoll comes straight from gravity,
-    // which is unambiguous through a full 360° turn, so "up" in the output
-    // always points away from gravity — it can't record upside-down no matter
-    // what the browser reports for screen orientation. This is the fix for the
-    // sideways/upside-down recording.
+    // Level purely to gravity. fusedRoll comes straight from gravity, which is
+    // unambiguous through a full 360° turn, so the browser's unreliable
+    // screen-angle number is never used.
     //
-    // The old behavior subtracted getScreenAngleDeg(); that value is
-    // unreliable for a home-screen web app in landscape (often 180° wrong),
-    // which was the bug. It's only needed if the OS itself rotates the camera
-    // buffer (rotation unlocked). If you ever hit an orientation that's wrong,
-    // the on-screen COMPENSATE button flips this back on.
-    if (useScreenCompensation) {
-      return fusedRoll - getScreenAngleDeg() * DEG2RAD;
-    }
-    return fusedRoll;
+    // rollDir sets the direction of the counter-rotation. If the image comes
+    // out upside-down in landscape but fine in portrait, the direction is
+    // inverted for this device's sensor sign — the FLIP button toggles it.
+    // Flipping is safe for portrait (a ~0° tilt reversed is still ~0°).
+    return fusedRoll * rollDir;
   }
+
+  // Kept for the calibration helper below; screen compensation is no longer
+  // part of the leveling path (gravity-only is used).
+  function getScreenAngleDegUnused() { return getScreenAngleDeg(); }
 
   // Shortest-path angle interpolation. A naive lerp between e.g. +179° and
   // -179° would spin the long way around; this always takes the short way,
@@ -637,7 +634,7 @@
     // judge orientation reliably); try again next frame.
     if (Math.hypot(gravX, gravY) < 4.0) return;
     const roll = fusedInit ? fusedRoll : Math.atan2(gravX, gravY) * ROLL_SIGN;
-    const compensated = useScreenCompensation ? (roll - getScreenAngleDeg() * DEG2RAD) : roll;
+    const compensated = roll;
     if (Math.cos(compensated) < 0) {
       // Computed roll is closer to 180° than 0° while the user is holding
       // the phone normally -> this platform's gravity sign is inverted.
@@ -901,14 +898,14 @@
   //                       if the OS rotates the camera buffer / rotation
   //                       unlocked). Provided so you're never stuck if your
   //                       device happens to need it.
+  // FLIP: reverses the horizon counter-rotation direction. Use it if the
+  // image is upside-down in landscape — one tap. Portrait is unaffected.
   const compBtn = document.getElementById('compBtn');
   compBtn.addEventListener('click', function () {
-    useScreenCompensation = !useScreenCompensation;
-    compBtn.textContent = useScreenCompensation ? 'SCREEN' : 'GRAVITY';
-    compBtn.classList.toggle('screen', useScreenCompensation);
-    // Re-run the one-time gravity sign calibration under the new mode so the
-    // up/down reference is correct for whichever leveling is active.
-    signCalibrated = false;
+    rollDir = -rollDir;
+    compBtn.classList.toggle('screen', rollDir > 0);
+    // Snap so the change is immediate rather than sweeping 180° slowly.
+    smoothedRoll = computeTargetRoll();
   });
 
 })();
