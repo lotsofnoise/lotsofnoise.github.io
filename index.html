@@ -730,15 +730,16 @@
   function previewFit() {
     const vw = window.innerWidth;
     const vh = window.innerHeight;
-    // Base size = the landscape frame fit to the viewport WIDTH (letterbox in
-    // portrait — the look you already had at rest).
+    // Base size = the landscape frame fit to the viewport WIDTH.
     const wUp = Math.min(vw, vh * OUT_ASPECT);
     const hUp = wUp / OUT_ASPECT;
-    // When shown sideways, scale so the (rotated) frame fills the screen using
-    // the viewport's long side — this is what produces the fullscreen-landscape
-    // look and the zoom-in relative to the portrait strip.
+    // Sideways (landscape) fill: rotated frame fills using the long side.
     const sideways = Math.max(vw / hUp, vh / wUp);
-    return { wUp: wUp, hUp: hUp, sideways: sideways };
+    // Upright (portrait) fill: scale the landscape frame up until it fills the
+    // tall screen. This crops the frame's left/right edges in the PREVIEW only
+    // (the recording still captures the full landscape frame).
+    const portrait = Math.max(vw / wUp, vh / hUp);
+    return { wUp: wUp, hUp: hUp, sideways: sideways, portrait: portrait };
   }
 
   function applyPreview(rotDeg, scale, animate) {
@@ -766,7 +767,7 @@
   }
 
   function updatePreview() {
-    if (!fusedInit) { applyPreview(0, 1, false); return; }
+    if (!fusedInit) { applyPreview(0, previewFit().portrait, false); return; }
 
     // Physical roll of the phone (0 = upright portrait).
     const physical = fusedRoll * 180 / Math.PI;
@@ -786,16 +787,16 @@
       previewQuadrant = q;
       const sideways = (q === 90 || q === 270);
       const f = previewFit();
-      applyPreview(previewCssRotation, sideways ? f.sideways : 1, true);
+      applyPreview(previewCssRotation, sideways ? f.sideways : f.portrait, true);
     }
   }
 
   window.addEventListener('resize', function () {
     const sideways = (previewQuadrant === 90 || previewQuadrant === 270);
     const f = previewFit();
-    applyPreview(previewCssRotation, sideways ? f.sideways : 1, false);
+    applyPreview(previewCssRotation, sideways ? f.sideways : f.portrait, false);
   });
-  applyPreview(0, 1, false);
+  applyPreview(0, previewFit().portrait, false);
 
   // =========================================================================
   // 6. LOCAL RECORDING ENGINE (MediaRecorder -> Web Share -> Files/iCloud)
