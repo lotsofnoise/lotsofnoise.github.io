@@ -654,9 +654,21 @@
       while (d < -Math.PI) d += 2 * Math.PI;
       const moveDeg = Math.abs(d) * 180 / Math.PI;
       // Gain floor 0.06 (very steady when still) rising with real motion up to
-      // 0.6 (snappy). Tune the 0.05 slope up for more responsiveness.
+      // 0.6 (snappy).
       const gain = Math.min(0.6, 0.06 + moveDeg * 0.05);
-      smoothedRoll += d * gain;
+      let step = d * gain;
+
+      // SLEW-RATE CLAMP — the fix for violent shaking on tilt. When you tilt,
+      // your hand's motion adds acceleration on top of gravity, so the sensed
+      // "down" briefly swings wildly and the frame tries to chase it. A real
+      // roll never exceeds a bounded speed, so we cap how far the level angle
+      // may move per frame. Genuine tilts pass through; the wild spikes get
+      // limited to this controlled rate and simply can't shake the frame.
+      // 2.5°/frame ≈ 150°/sec — plenty for fast real rolls, far below spikes.
+      const MAX_STEP = 2.5 * DEG2RAD;
+      if (step >  MAX_STEP) step =  MAX_STEP;
+      if (step < -MAX_STEP) step = -MAX_STEP;
+      smoothedRoll += step;
 
       // --- Zoom -----------------------------------------------------------
       const srcAspect = video.videoWidth / video.videoHeight;
