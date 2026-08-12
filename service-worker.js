@@ -1,11 +1,9 @@
-// ---------------------------------------------------------------------------
-// Service worker: caches the app shell on install so the page (and the
-// WebGL/JS pipeline that makes it work) keeps loading with zero network,
-// once a user has visited it at least once. Camera/mic access itself always
-// requires the OS permission grant, but no network is needed for that.
-// ---------------------------------------------------------------------------
+'use strict';
 
-const CACHE_NAME = 'horizon-camera-v6m';
+// Change this version whenever index.html, manifest.json, or an icon changes.
+const CACHE_PREFIX = 'horizon-camera-';
+const CACHE_NAME = CACHE_PREFIX + 'v7';
+
 const APP_SHELL = [
   './',
   './index.html',
@@ -15,47 +13,158 @@ const APP_SHELL = [
   './icons/apple-touch-icon.png'
 ];
 
-// Bump CACHE_NAME (e.g. v2, v3...) whenever you deploy changes to index.html
-// so returning users pick up the new version instead of a stale cached copy.
+const INDEX_URL = new URL('./index.html', self.registration.scope).href;
 
+const APP_SHELL_URLS = new Set(
+  APP_SHELL.map((path) => new URL(path, self.registration.scope).href)
+);
+
+function isCacheable(response) {
+  return Boolean(
+    response &&
+    response.ok &&
+    response.type === 'basic'
+  );
+}
+
+// ---------------------------------------------------------------------------
+// INSTALL
+// Cache the complete app shell.
+// ---------------------------------------------------------------------------
 self.addEventListener('install', (event) => {
-  event.waitUntil(
-    caches.open(CACHE_NAME)
-      .then((cache) => cache.addAll(APP_SHELL))
-      .then(() => self.skipWaiting())
-  );
-});
+  event.waitUntil((async () => {
+    const cache = await caches.open(CACHE_NAME);
 
-self.addEventListener('activate', (event) => {
-  event.waitUntil(
-    caches.keys().then((keys) =>
-      Promise.all(
-        keys.filter((key) => key !== CACHE_NAME)
-            .map((key) => caches.delete(key))
+    // Force fresh copies during installation rather than reusing the browser's
+    // normal HTTP cache.
+    const requests = APP_SHELL.map((path) =>
+      new Request(
+        new URL(path, self.registration.scope),
+        { cache: 'reload' }
       )
-    ).then(() => self.clients.claim())
-  );
+    );
+
+    await cache.addAll(requests);
+    await self.skipWaiting();
+  })());
 });
 
-// Cache-first strategy: serve instantly from cache, and in the background
-// fetch a fresh copy to keep the cache warm for next time (stale-while-revalidate).
+// ---------------------------------------------------------------------------
+// ACTIVATE
+// Delete only old Horizon Camera caches.
+// ---------------------------------------------------------------------------
+self.addEventListener('activate', (event) => {
+  event.waitUntil((async () => {
+    const keys = await caches.keys();
+
+    await Promise.all(
+      keys
+        .filter(
+          (key) =>
+            key.startsWith(CACHE_PREFIX) &&
+            key !== CACHE_NAME
+        )
+        .map((key) => caches.delete(key))
+    );
+
+    await self.clients.claim();
+  })());
+});
+
+// ---------------------------------------------------------------------------
+// FETCH
+// Network-first for HTML.
+// Stale-while-revalidate for manifest and icons.
+// ---------------------------------------------------------------------------
 self.addEventListener('fetch', (event) => {
-  // Only handle same-origin GET requests for the app shell files.
-  if (event.request.method !== 'GET') return;
+  const request = event.request;
+
+  if (request.method !== 'GET') {
+    return;
+  }
+
+  const url = new URL(request.url);
+
+  // Do not interfere with third-party or cross-origin requests.
+  if (url.origin !== self.location.origin) {
+    return;
+  }
+
+  // Network-first for page navigations.
+  // This lets a newly deployed index.html appear immediately while retaining
+  // the cached page as an offline fallback.
+  if (request.mode === 'navigate') {
+    event.respondWith((async () => {
+      try {
+        const response = await fetch(request);
+
+        if (isCacheable(response)) {
+          const cache = await caches.open(CACHE_NAME);
+
+          await Promise.all([
+            cache.put(request, response.clone()),
+            cache.put(INDEX_URL, response.clone())
+          ]);
+        }
+
+        return response;
+      } catch (error) {
+        return (
+          await caches.match(request) ||
+          await caches.match(INDEX_URL) ||
+          new Response(
+            'Horizon Camera is offline and has not finished caching yet.',
+            {
+              status: 503,
+              headers: {
+                'Content-Type': 'text/plain; charset=utf-8'
+              }
+            }
+          )
+        );
+      }
+    })());
+
+    return;
+  }
+
+  // Only cache known app-shell resources.
+  if (!APP_SHELL_URLS.has(url.href)) {
+    return;
+  }
+
+  // Refresh the cached resource in the background.
+  const networkUpdate = fetch(request).then(async (response) => {
+    if (isCacheable(response)) {
+      const cache = await caches.open(CACHE_NAME);
+      await cache.put(request, response.clone());
+    }
+
+    return response;
+  });
+
+  // Keep the worker alive until the background update finishes.
+  event.waitUntil(
+    networkUpdate.then(
+      () => undefined,
+      () => undefined
+    )
+  );
 
   event.respondWith(
-    caches.match(event.request).then((cachedResponse) => {
-      const networkFetch = fetch(event.request)
-        .then((networkResponse) => {
-          if (networkResponse && networkResponse.status === 200) {
-            const clone = networkResponse.clone();
-            caches.open(CACHE_NAME).then((cache) => cache.put(event.request, clone));
+    caches
+      .match(request)
+      .then((cachedResponse) => cachedResponse || networkUpdate)
+      .catch(() =>
+        new Response(
+          'Resource unavailable while offline.',
+          {
+            status: 503,
+            headers: {
+              'Content-Type': 'text/plain; charset=utf-8'
+            }
           }
-          return networkResponse;
-        })
-        .catch(() => cachedResponse); // offline: fall back to cache
-
-      return cachedResponse || networkFetch;
-    })
+        )
+      )
   );
 });

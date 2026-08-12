@@ -180,6 +180,7 @@
   // when panning the camera.
   let gravX = 0;
   let gravY = 0;
+  let gravZ = 0;
   let gravInit = false; // becomes true after the first sensor reading seeds the filter
   let restMag = 0;      // learned "1g" force magnitude (unit-agnostic baseline)
   let restMagInit = false;
@@ -191,31 +192,39 @@
   const GRAVITY_SMOOTHING = 0.1;
 
   // --- GYRO FUSION (the "gimbal feel") --------------------------------------
-  // A complementary filter: the gyroscope's rotationRate is integrated for
-  // instant, motion-noise-free response (this is what a physical gimbal
-  // does), while the accelerometer's gravity direction gently corrects the
-  // slow drift that pure integration accumulates. Gyro = fast + drifty,
-  // accel = slow + absolute; blended, they give fast + absolute.
-  let fusedRoll = 0;          // device-frame fused roll (radians)
+  // The gyro carries the image through fast rolls while gravity provides the
+  // absolute horizon reference. The DeviceMotion rotationRate field mapping
+  // changed in the current specification, while deployed browsers may still
+  // expose the legacy alpha/beta/gamma mapping. Instead of hardcoding one
+  // property, this version evaluates all field-to-axis permutations and learns
+  // which one predicts the accelerometer's measured roll velocity.
+  let fusedRoll = 0;          // continuous device-frame fused roll (radians)
   let fusedInit = false;
   let lastMotionT = 0;        // ms timestamp of previous devicemotion event
+  let prevRawARoll = null;    // unsmoothed gravity roll used only for calibration
 
-  // How strongly the accelerometer pulls the fused angle back per event.
-  // Small = trust the gyro (steadier during motion); large = trust the
-  // accelerometer (faster drift correction). ~0.02 at 60Hz ≈ ~1s correction.
-  const ACCEL_CORRECTION = 0.02;
+  const GYRO_MAPPINGS = [
+    // Current Device Motion draft: alpha=x, beta=y, gamma=z.
+    { name: 'modern xyz', x: 'alpha', y: 'beta',  z: 'gamma' },
+    // Widely deployed legacy mapping: alpha=z, beta=x, gamma=y.
+    { name: 'legacy zxy', x: 'beta',  y: 'gamma', z: 'alpha' },
+    // Remaining permutations are defensive fallbacks for browser quirks.
+    { name: 'xzy',        x: 'alpha', y: 'gamma', z: 'beta'  },
+    { name: 'yxz',        x: 'beta',  y: 'alpha', z: 'gamma' },
+    { name: 'yzx',        x: 'gamma', y: 'alpha', z: 'beta'  },
+    { name: 'zyx',        x: 'gamma', y: 'beta',  z: 'alpha' }
+  ];
+  const gyroMappingScores = new Float64Array(GYRO_MAPPINGS.length);
+  let gyroMappingIndex = -1;
+  let gyroRateSign = 1;
+  let gyroMappingStable = false;
+  let lastGyroRateDeg = 0;
+  let lastGyroEventT = 0;
+  let lastGyroDebugKey = '';
 
-  // Gyro direction self-calibration. The sign convention of rotationRate
-  // varies across platforms, and integrating with the wrong sign would make
-  // the horizon fight the rotation instead of cancelling it. Instead of
-  // guessing, the code correlates the gyro rate against the accelerometer
-  // roll velocity during the user's first movements: consistent agreement
-  // fixes the sign. Until calibrated, the filter runs accelerometer-only
-  // (the previous behavior), so nothing breaks in the meantime.
-  let gyroSign = 0;           // 0 = not yet calibrated
-  let gyroScore = 0;
-  let prevARoll = null;
-  const GYRO_SCORE_NEEDED = 8;
+  const GYRO_LEARN_MIN_ACCEL_RATE = 8;  // deg/s
+  const GYRO_LEARN_MIN_PRED_RATE  = 8;  // deg/s
+  const GYRO_MAPPING_LOCK_SCORE   = 0.45;
 
   // --- ZOOM MODE -------------------------------------------------------------
   // 'locked'  = constant zoom (default): the image ONLY rotates, never
@@ -253,8 +262,9 @@
   let motionListenerAttached = false;
 
   // Smoothed rotation actually sent to the GPU (radians). Smoothing prevents
-  // jittery, noisy sensor data from causing a shaky/flickering horizon.
+  // jitter at rest, while gyro-rate-assisted gain removes visible lag in a flip.
   let smoothedRoll = 0;
+  let lastRenderT = 0;
 
   // Smoothed dynamic zoom. The raw cover-zoom is already a continuous
   // function of the roll angle; this light smoothing additionally hides the
@@ -477,97 +487,268 @@
     return a + diff * t;
   }
 
+  function clamp(value, min, max) {
+    return Math.max(min, Math.min(max, value));
+  }
+
+  function finiteRotationRate(rr, field) {
+    if (!rr) return null;
+    const value = rr[field];
+    return (typeof value === 'number' && Number.isFinite(value)) ? value : null;
+  }
+
+  // Predict the rate of change of atan2(gx, gy) from the full device-local
+  // angular-velocity vector. This is more accurate than reading only the Z
+  // component when the phone is also pitched or yawed.
+  function predictRollRateDeg(gx, gy, gz, wx, wy, wz) {
+    const plane2 = gx * gx + gy * gy;
+    if (plane2 < 0.25) return null; // horizon is undefined near camera-up/down
+
+    // For a world-fixed gravity vector expressed in the rotating device frame:
+    // gDot = -omega x g. Differentiating atan2(gx, gy) simplifies to this.
+    return wz - gz * (gx * wx + gy * wy) / plane2;
+  }
+
+  function resetGyroCalibration() {
+    gyroMappingScores.fill(0);
+    gyroMappingIndex = -1;
+    gyroRateSign = 1;
+    gyroMappingStable = false;
+    prevRawARoll = null;
+    lastGyroRateDeg = 0;
+    lastGyroEventT = 0;
+    lastGyroDebugKey = '';
+  }
+
+  // Learns both the browser's alpha/beta/gamma mapping and its rate sign, then
+  // returns a roll rate in the same sign convention as the gravity roll.
+  function getGyroRollRate(rr, gx, gy, gz, accelRollVelocityDeg, calibrationTrust) {
+    if (!rr) return null;
+
+    const clearAccelReference =
+      Number.isFinite(accelRollVelocityDeg) &&
+      Math.abs(accelRollVelocityDeg) >= GYRO_LEARN_MIN_ACCEL_RATE &&
+      calibrationTrust >= 0.05;
+
+    const predictions = new Array(GYRO_MAPPINGS.length).fill(null);
+    const samples = new Float64Array(GYRO_MAPPINGS.length);
+    let bestIndex = -1;
+    let bestRank = -Infinity;
+
+    for (let i = 0; i < GYRO_MAPPINGS.length; i++) {
+      const mapping = GYRO_MAPPINGS[i];
+      const wx = finiteRotationRate(rr, mapping.x);
+      const wy = finiteRotationRate(rr, mapping.y);
+      const wz = finiteRotationRate(rr, mapping.z);
+
+      if (wx === null && wy === null && wz === null) continue;
+
+      const predicted = predictRollRateDeg(
+        gx, gy, gz,
+        wx === null ? 0 : wx,
+        wy === null ? 0 : wy,
+        wz === null ? 0 : wz
+      );
+      if (!Number.isFinite(predicted)) continue;
+      predictions[i] = predicted;
+
+      let sample = 0;
+      if (clearAccelReference && Math.abs(predicted) >= GYRO_LEARN_MIN_PRED_RATE) {
+        // +/-1 means same magnitude and direction/opposite direction. Values
+        // near zero mean the candidate predicts the wrong magnitude or no roll.
+        const magnitudeSimilarity =
+          Math.min(Math.abs(predicted), Math.abs(accelRollVelocityDeg)) /
+          Math.max(Math.abs(predicted), Math.abs(accelRollVelocityDeg), 1);
+        sample = (predicted * accelRollVelocityDeg >= 0 ? 1 : -1) * magnitudeSimilarity;
+
+        const activity = clamp(Math.abs(accelRollVelocityDeg) / 180, 0.25, 1);
+        const learn = clamp((0.12 + 0.18 * activity) * calibrationTrust, 0.04, 0.30);
+        gyroMappingScores[i] = gyroMappingScores[i] * (1 - learn) + sample * learn;
+      } else {
+        // Very slow decay lets the calibration recover if a browser changes its
+        // mapping after an orientation or camera-pipeline transition.
+        gyroMappingScores[i] *= 0.998;
+      }
+      samples[i] = sample;
+
+      const rank = Math.abs(gyroMappingScores[i]) +
+                   (clearAccelReference ? 0.35 * Math.abs(sample) : 0);
+      if (rank > bestRank) {
+        bestRank = rank;
+        bestIndex = i;
+      }
+    }
+
+    if (bestIndex >= 0 && clearAccelReference && Math.abs(samples[bestIndex]) > 0.20) {
+      if (gyroMappingIndex < 0 || !gyroMappingStable) {
+        gyroMappingIndex = bestIndex;
+      } else if (bestIndex !== gyroMappingIndex) {
+        const currentStrength = Math.abs(gyroMappingScores[gyroMappingIndex]);
+        const bestStrength = Math.abs(gyroMappingScores[bestIndex]);
+        if (bestStrength > currentStrength + 0.18) gyroMappingIndex = bestIndex;
+      }
+    }
+
+    if (gyroMappingIndex < 0) return null;
+
+    const selectedSample = samples[gyroMappingIndex];
+    const selectedScore = gyroMappingScores[gyroMappingIndex];
+    if (Math.abs(selectedSample) > 0.15) {
+      gyroRateSign = selectedSample >= 0 ? 1 : -1;
+    } else if (Math.abs(selectedScore) > 0.08) {
+      gyroRateSign = selectedScore >= 0 ? 1 : -1;
+    }
+
+    gyroMappingStable = Math.abs(selectedScore) >= GYRO_MAPPING_LOCK_SCORE;
+
+    const debugKey = gyroMappingIndex + ':' + gyroRateSign + ':' + gyroMappingStable;
+    if (gyroMappingStable && debugKey !== lastGyroDebugKey) {
+      lastGyroDebugKey = debugKey;
+      console.info(
+        'Horizon gyro mapping:',
+        GYRO_MAPPINGS[gyroMappingIndex].name,
+        'sign:',
+        gyroRateSign
+      );
+    }
+
+    const selectedPrediction = predictions[gyroMappingIndex];
+    return Number.isFinite(selectedPrediction)
+      ? selectedPrediction * gyroRateSign
+      : null;
+  }
+
   function handleMotion(evt) {
     const g = evt.accelerationIncludingGravity;
     if (!g || g.x === null || g.y === null) return;
 
     const now = performance.now();
-    const dt = lastMotionT ? Math.min((now - lastMotionT) / 1000, 0.1) : 0;
+    const rawDt = lastMotionT ? (now - lastMotionT) / 1000 : 0;
+    // Ignore a long event gap instead of integrating a stale gyro sample across it.
+    const dt = rawDt > 0 && rawDt <= 0.25 ? Math.min(rawDt, 0.1) : 0;
     lastMotionT = now;
 
-    // Apply the (auto-calibrated) platform sign correction at the source so
-    // all downstream math works in one consistent convention.
+    // Apply the auto-calibrated platform sign at the source so accelerometer and
+    // gyro calibration operate in one consistent gravity convention.
     const gx = g.x * gravitySign;
     const gy = g.y * gravitySign;
-    const hasZ = (g.z !== null && g.z !== undefined);
-    const gz = hasZ ? g.z : 0;
+    const hasZ = (g.z !== null && g.z !== undefined && Number.isFinite(g.z));
+    const gz = hasZ ? g.z * gravitySign : 0;
+    const rawARoll = Math.atan2(gx, gy) * ROLL_SIGN;
 
-    // --- MOTION REJECTION (the fix for shaking on tilt) ------------------
-    // A phone feeling only gravity reads a total force of ~9.81 m/s² (1g).
-    // When your hand adds motion, the total departs from 1g — and in that
-    // moment the sensed "down" is unreliable. So we weight how much we trust
-    // this reading by how close the force is to 1g: near 1g -> trust fully;
-    // far from 1g (active motion) -> trust little and hold the frame steady.
-    // Only valid when the full 3D force is available (needs z); otherwise the
-    // in-plane magnitude drops when you point up/down and would misfire, so we
-    // trust fully in that case.
-    let trust = 1;
+    // Acceleration-magnitude trust is kept separate from rotational trust. The
+    // former is useful for learning the gyro mapping even during a clean roll;
+    // the latter controls how much raw gravity enters the level reference.
+    let accelTrust = 1;
+    let forceMag = Math.hypot(gx, gy);
     if (hasZ) {
-      const mag = Math.sqrt(gx * gx + gy * gy + gz * gz);
-      // Learn the device's rest ("1g") magnitude the first time, so this works
-      // whether the browser reports m/s² (~9.81) or g (~1) — no unit guessing.
-      if (!restMagInit) { restMag = mag; restMagInit = true; }
-      const off = Math.abs(mag - restMag) / restMag;  // 0 = pure gravity
-      trust = Math.max(0.05, 1 - off * 3.0);           // 1 still … 0.05 moving
-      restMag += (mag - restMag) * 0.02 * trust;
-    }
-
-    // --- GYRO AS A MOTION DETECTOR (the flip-shake fix) ------------------
-    // The gyro measures rotation SPEED, which needs no sign to be useful. A
-    // flip is a fast rotation, and that's exactly when the accelerometer's
-    // "down" is most corrupted by hand motion. So when the phone is rotating
-    // fast, we drop trust and hold the frame steady instead of chasing the
-    // shaky reading; it settles to level the instant the flip stops. Using
-    // only the magnitude sidesteps the gyro-sign bug that caused drift-snap.
-    const rr = evt.rotationRate;
-    if (rr) {
-      const rotMag = Math.sqrt(
-        (rr.alpha || 0) * (rr.alpha || 0) +
-        (rr.beta  || 0) * (rr.beta  || 0) +
-        (rr.gamma || 0) * (rr.gamma || 0)
-      ); // deg/s
-      // Full trust up to ~40°/s (normal handling); ramp down to a near-freeze
-      // by ~240°/s (a flip). Raise the 40 for looser, lower for tighter.
-      if (rotMag > 40) {
-        const rotTrust = Math.max(0.05, 1 - (rotMag - 40) / 200);
-        trust = Math.min(trust, rotTrust);
+      forceMag = Math.sqrt(gx * gx + gy * gy + gz * gz);
+      if (!restMagInit && forceMag > 0.001) {
+        restMag = forceMag;
+        restMagInit = true;
+      }
+      if (restMagInit && restMag > 0.001) {
+        const off = Math.abs(forceMag - restMag) / restMag;
+        accelTrust = Math.max(0.05, 1 - off * 3.0);
+        restMag += (forceMag - restMag) * 0.02 * accelTrust;
       }
     }
 
+    const rr = evt.rotationRate;
+    let rotMag = 0;
+    if (rr) {
+      const ra = finiteRotationRate(rr, 'alpha') || 0;
+      const rb = finiteRotationRate(rr, 'beta')  || 0;
+      const rg = finiteRotationRate(rr, 'gamma') || 0;
+      rotMag = Math.sqrt(ra * ra + rb * rb + rg * rg);
+    }
+
+    // Fast rotation makes accelerationIncludingGravity less reliable as an
+    // absolute reference. Freeze that reference while the gyro carries the roll.
+    let trust = accelTrust;
+    if (rotMag > 40) {
+      const rotTrust = Math.max(0.05, 1 - (rotMag - 40) / 200);
+      trust = Math.min(trust, rotTrust);
+    }
     const adaptiveGravity = GRAVITY_SMOOTHING * trust;
 
-    // Seed the filter with the first real reading so it doesn't have to ramp
-    // up from zero (which would cause a visible swing on startup).
     if (!gravInit) {
       gravX = gx;
       gravY = gy;
+      gravZ = gz;
       gravInit = true;
+      prevRawARoll = rawARoll;
       return;
     }
 
-    // Low-pass gravity filter, weighted by motion trust: when the phone is
-    // being moved, adaptiveGravity is tiny, so the level reference barely
-    // updates and the frame stays steady instead of shaking.
     gravX += (gx - gravX) * adaptiveGravity;
     gravY += (gy - gravY) * adaptiveGravity;
+    gravZ += (gz - gravZ) * adaptiveGravity;
 
-    // Accelerometer-derived roll, in the DEVICE frame (screen-rotation
-    // compensation is applied later, at render time — the gyro measures
-    // device-frame rotation, so fusion must happen in the device frame too).
     const aRoll = Math.atan2(gravX, gravY) * ROLL_SIGN;
 
     if (!fusedInit) {
       fusedRoll = aRoll;
       fusedInit = true;
-      prevARoll = aRoll;
-      return;
+      // Do not return here. The previous raw gravity sample already exists, so
+      // the second motion event can identify and integrate the gyro immediately.
     }
-    prevARoll = aRoll;
 
-    // Level from gravity. During fast rotation the trust-weighted update above
-    // has already frozen gravX/gravY, so aRoll holds steady through a flip and
-    // settles to level the moment it ends — no shake, no gyro-sign drift-snap.
-    fusedRoll = aRoll;
+    // The unsmoothed gravity angle is used only as a short-term velocity
+    // reference for identifying the browser's gyro mapping and sign.
+    let accelRollVelocityDeg = null;
+    if (dt > 0 && prevRawARoll !== null) {
+      let dA = rawARoll - prevRawARoll;
+      while (dA > Math.PI)  dA -= 2 * Math.PI;
+      while (dA < -Math.PI) dA += 2 * Math.PI;
+      const candidate = (dA / dt) / DEG2RAD;
+      if (Number.isFinite(candidate) && Math.abs(candidate) <= 3000) {
+        accelRollVelocityDeg = candidate;
+      }
+    }
+
+    const inPlane = Math.hypot(gx, gy);
+    const planeRatio = forceMag > 0.001 ? inPlane / forceMag : 0;
+    const calibrationTrust = accelTrust * clamp((planeRatio - 0.15) / 0.55, 0, 1);
+
+    let gyroRollRateDeg = null;
+    if (dt > 0) {
+      gyroRollRateDeg = getGyroRollRate(
+        rr,
+        gx, gy, gz,
+        accelRollVelocityDeg,
+        calibrationTrust
+      );
+    }
+
+    if (Number.isFinite(gyroRollRateDeg)) {
+      // Protect against a corrupt one-frame browser reading while still allowing
+      // extremely fast deliberate spins.
+      gyroRollRateDeg = clamp(gyroRollRateDeg, -2400, 2400);
+      fusedRoll += gyroRollRateDeg * DEG2RAD * dt;
+      lastGyroRateDeg = gyroRollRateDeg;
+      lastGyroEventT = now;
+
+      // Gravity removes gyro drift when the phone is calm. During a fast roll the
+      // correction nearly switches off, so the image follows the gyro without lag
+      // or the old settle-and-snap behavior.
+      const filteredMag = Math.sqrt(
+        gravX * gravX + gravY * gravY + gravZ * gravZ
+      );
+      const filteredPlaneRatio = filteredMag > 0.001
+        ? Math.hypot(gravX, gravY) / filteredMag
+        : 0;
+      const speedFade = 1 - clamp((Math.abs(gyroRollRateDeg) - 20) / 180, 0, 1);
+      const correction = 0.001 + 0.075 * trust * filteredPlaneRatio * speedFade;
+      fusedRoll = lerpAngle(fusedRoll, aRoll, correction);
+    } else {
+      // No usable gyro yet or no gyro hardware. Continue with gravity instead of
+      // freezing, but interpolate to avoid a one-frame jump.
+      const fallbackCorrection = clamp(0.15 + 0.55 * trust, 0.15, 0.70);
+      fusedRoll = lerpAngle(fusedRoll, aRoll, fallbackCorrection);
+    }
+
+    prevRawARoll = rawARoll;
   }
 
   // =========================================================================
@@ -619,6 +800,7 @@
       await requestMotionPermission();
       await requestCameraAndMic();
       overlay.style.display = 'none';
+      lastRenderT = 0;
       requestAnimationFrame(renderLoop);
     } catch (err) {
       fatalError(err.message || 'Could not start camera.');
@@ -651,17 +833,21 @@
       gravitySign = -1;
       gravX = -gravX;
       gravY = -gravY;
+      gravZ = -gravZ;
       // The absolute reference just flipped by 180°: resync the fused angle
-      // and restart the gyro direction calibration against the new reference.
+      // and restart gyro mapping/sign calibration against the new reference.
       fusedRoll = Math.atan2(gravX, gravY) * ROLL_SIGN;
-      prevARoll = fusedRoll;
-      gyroScore = 0;
-      gyroSign = 0;
+      resetGyroCalibration();
     }
     signCalibrated = true;
   }
 
-  function renderLoop() {
+  function renderLoop(frameTime) {
+    const frameNow = Number.isFinite(frameTime) ? frameTime : performance.now();
+    const renderDt = lastRenderT
+      ? clamp((frameNow - lastRenderT) / 1000, 1 / 240, 0.05)
+      : 1 / 60;
+    lastRenderT = frameNow;
     if (video.readyState >= video.HAVE_CURRENT_DATA && video.videoWidth > 0) {
       calibrateGravitySign();
 
@@ -669,31 +855,27 @@
       gl.bindTexture(gl.TEXTURE_2D, texture);
       gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, video);
 
-      // Recompute the horizon-lock rotation every frame, then smooth it
-      // ADAPTIVELY: when the phone is nearly still, the frame-to-frame change is
-      // just sensor noise, so smooth it hard (kills the jiggle); when you
-      // genuinely move, the change is large, so respond fast (kills the lag).
-      // A single fixed lerp can't do both — that's why it felt late AND jittery.
+      // Recompute the horizon-lock rotation every frame. At rest, use a low
+      // gain to suppress sensor noise. During a gyro-confirmed roll, boost the
+      // gain to near one-frame response and raise the time-based safety limit so
+      // a fast 360° spin is not throttled by the renderer.
       const target = computeTargetRoll();
       let d = target - smoothedRoll;
       while (d > Math.PI)  d -= 2 * Math.PI;
       while (d < -Math.PI) d += 2 * Math.PI;
-      const moveDeg = Math.abs(d) * 180 / Math.PI;
-      // Gain floor 0.06 (very steady when still) rising with real motion up to
-      // 0.6 (snappy).
-      const gain = Math.min(0.6, 0.06 + moveDeg * 0.05);
+      const moveDeg = Math.abs(d) / DEG2RAD;
+      const gyroFresh = (frameNow - lastGyroEventT) < 140;
+      const gyroSpeed = gyroFresh ? Math.abs(lastGyroRateDeg) : 0;
+      const gyroBoost = clamp(gyroSpeed / 120, 0, 1);
+      const gain = Math.min(0.98, 0.06 + moveDeg * 0.05 + gyroBoost * 0.72);
       let step = d * gain;
 
-      // SLEW-RATE CLAMP — the fix for violent shaking on tilt. When you tilt,
-      // your hand's motion adds acceleration on top of gravity, so the sensed
-      // "down" briefly swings wildly and the frame tries to chase it. A real
-      // roll never exceeds a bounded speed, so we cap how far the level angle
-      // may move per frame. Genuine tilts pass through; the wild spikes get
-      // limited to this controlled rate and simply can't shake the frame.
-      // 2.5°/frame ≈ 150°/sec — plenty for fast real rolls, far below spikes.
-      const MAX_STEP = 2.5 * DEG2RAD;
-      if (step >  MAX_STEP) step =  MAX_STEP;
-      if (step < -MAX_STEP) step = -MAX_STEP;
+      // 720°/s at rest is still an outlier guard; active gyro motion raises the
+      // ceiling to 2520°/s, enough for a very fast hand-driven barrel roll.
+      const maxRenderRateDeg = 720 + 1800 * gyroBoost;
+      const maxStep = maxRenderRateDeg * DEG2RAD * renderDt;
+      if (step >  maxStep) step =  maxStep;
+      if (step < -maxStep) step = -maxStep;
       smoothedRoll += step;
 
       // --- Zoom -----------------------------------------------------------
