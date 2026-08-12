@@ -397,32 +397,18 @@
   const uSrcAspectLoc = gl.getUniformLocation(program, 'uSrcAspect');
 
   // FIXED landscape output frame — the heart of the Horizon behavior.
-  // The recording FOLLOWS orientation: the output frame is portrait (tall)
-  // when you hold the phone upright and landscape (wide) when sideways, so the
-  // saved video matches what you see — like the built-in camera. The frame
-  // only commits when you've clearly settled into an orientation (see
-  // updatePreview), and never changes mid-recording, so clips can't morph.
-  let OUT_ASPECT = 1920 / 1080;
-
-  function setOutputAspect(aspect) {
-    OUT_ASPECT = aspect;
-    let w, h;
-    if (aspect >= 1) { h = 1080; w = Math.round(h * aspect); }
-    else { w = 1080; h = Math.round(w / aspect); }
-    w -= (w % 2); h -= (h % 2);   // even dims for the encoder
-    canvas.width = w;
-    canvas.height = h;
-    gl.viewport(0, 0, w, h);
-    gl.uniform1f(uOutAspectLoc, OUT_ASPECT);
-    lockedZoomAspect = 0;         // force zoom to recompute for the new shape
-  }
-
-  // Open matching the current orientation (portrait on a phone).
-  setOutputAspect(
-    window.innerWidth < window.innerHeight
-      ? (window.innerWidth / window.innerHeight)
-      : (1920 / 1080)
-  );
+  // The canvas is the recording target, so it NEVER resizes: recordings are
+  // always 1920x1080 landscape regardless of how the phone is held, and the
+  // stream dimensions can't change mid-encode (which was corrupting/"morphing"
+  // recordings when the old code resized the canvas with the screen).
+  // Drop to 1280x720 if an older device stutters while recording.
+  const OUT_WIDTH  = 1920;
+  const OUT_HEIGHT = 1080;
+  const OUT_ASPECT = OUT_WIDTH / OUT_HEIGHT;
+  canvas.width  = OUT_WIDTH;
+  canvas.height = OUT_HEIGHT;
+  gl.viewport(0, 0, OUT_WIDTH, OUT_HEIGHT);
+  gl.uniform1f(uOutAspectLoc, OUT_ASPECT);
 
   // =========================================================================
   // 3. INVERSION-SHIELD SENSOR MATH
@@ -759,16 +745,22 @@
     const f = previewFit();
     canvas.style.width  = f.wUp + 'px';
     canvas.style.height = f.hUp + 'px';
-    // Snap straight to the target orientation (no visible rotation sweep, which
-    // was the awkward part). A quick opacity fade softens the cut so it reads
-    // as a clean switch to the new orientation rather than a spin.
-    canvas.style.transform = 'translate(-50%,-50%) rotate(' + rotDeg + 'deg) scale(' + scale + ')';
+    const end = 'translate(-50%,-50%) rotate(' + rotDeg + 'deg) scale(' + scale + ')';
     if (animate) {
+      // Zoom-in through the turn: a mid keyframe scaled up enough to cover the
+      // screen at the diagonal, so no black corners show while it rotates.
+      const midScale = Math.max(scale, canvas._lastScale || 1) * 1.25;
+      const midRot = ((canvas._lastRot || 0) + rotDeg) / 2;
       canvas.animate(
-        [{ opacity: 0.15 }, { opacity: 1 }],
-        { duration: 180, easing: 'ease-out', fill: 'none' }
+        [
+          { transform: 'translate(-50%,-50%) rotate(' + (canvas._lastRot || 0) + 'deg) scale(' + (canvas._lastScale || 1) + ')' },
+          { transform: 'translate(-50%,-50%) rotate(' + midRot + 'deg) scale(' + midScale + ')', offset: 0.5 },
+          { transform: end }
+        ],
+        { duration: 420, easing: 'ease-in-out', fill: 'none' }
       );
     }
+    canvas.style.transform = end;
     canvas._lastRot = rotDeg;
     canvas._lastScale = scale;
   }
@@ -784,23 +776,15 @@
 
     if (Math.abs(rel) > 45 + PREVIEW_HYSTERESIS) {
       const q = ((Math.round(physical / 90) * 90) % 360 + 360) % 360;
-      const sideways = (q === 90 || q === 270);
-
-      // Make the RECORDING follow the turn: switch the output frame to match
-      // this orientation (landscape = wide 16:9, portrait = tall/screen-shaped)
-      // so the saved video matches what you see. Never switch mid-recording.
-      if (!isRecording) {
-        const desired = sideways ? (1920 / 1080)
-                                 : (window.innerWidth / window.innerHeight);
-        if (Math.abs(OUT_ASPECT - desired) > 0.01) setOutputAspect(desired);
-      }
-
       // Rotate the preview the SAME direction as the physical turn so the
-      // (already-upright) content stays upright to you in landscape.
+      // (already-upright) content stays upright to you in landscape. (This
+      // direction was flipped from -q, which showed landscape upside-down on
+      // device — a display-only sign; the recording is unaffected either way.)
       const targetCss = q;
       let delta = ((targetCss - previewCssRotation) % 360 + 540) % 360 - 180;
       previewCssRotation += delta;
       previewQuadrant = q;
+      const sideways = (q === 90 || q === 270);
       const f = previewFit();
       applyPreview(previewCssRotation, sideways ? f.sideways : 1, true);
     }
