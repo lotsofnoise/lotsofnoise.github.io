@@ -30,9 +30,16 @@
   /* Hidden <video> element — used purely as a WebGL texture source, never shown directly */
   #srcVideo { position:absolute; width:1px; height:1px; opacity:0; pointer-events:none; }
 
-  /* The visible output — a FIXED landscape (16:9) frame, letterboxed on
-     portrait screens exactly like the real Horizon app's portrait view */
-  #glCanvas { position:fixed; top:0; left:0; width:100vw; height:100vh; display:block; background:#000; object-fit:contain; }
+  /* The visible output — a FIXED landscape (16:9) frame. Its on-screen
+     size and rotation are driven from JS so the preview always appears
+     level with the physical world, even when the OS orientation lock
+     prevents the browser UI itself from rotating. */
+  #glCanvas {
+    position:fixed; top:50%; left:50%;
+    background:#000;
+    transform-origin:center center;
+    transition: transform 0.35s cubic-bezier(0.22, 1, 0.36, 1);
+  }
 
   /* ---------- PERMISSION / START OVERLAY ---------- */
   #startOverlay {
@@ -428,29 +435,46 @@
   // atan2(x, y) of the gravity vector's screen-plane components gives a
   // continuous roll angle with no branch jumps or snapping, which is what
   // makes it flip-proof through a full 360° rotation.
-  function getScreenAngleDeg() {
-    // Prefer the modern Screen Orientation API (Android Chrome, and
-    // iOS Safari 16.4+, so this is the path virtually all modern devices take).
-    if (screen.orientation && typeof screen.orientation.angle === 'number') {
-      return screen.orientation.angle;
+  // =========================================================================
+  // 3b. BUFFER ROTATION ANCHORING (replaces screen-angle compensation)
+  // =========================================================================
+  // The shader needs the camera buffer's rotation relative to the WORLD:
+  //   buffer-vs-world = device-vs-world (fusedRoll) + buffer-vs-device (psi)
+  // psi is always a multiple of 90°, but reading it from the orientation
+  // APIs proved unreliable: sign conventions differ between APIs and
+  // platforms, and in iOS home-screen (standalone PWA) mode the reported
+  // angle can simply stay 0 while the camera buffer still rotates — which
+  // made landscape render sideways while portrait worked perfectly.
+  //
+  // So the API's VALUE is never used. Instead, psi is inferred from gravity
+  // at moments when it is unambiguous: the OS only rotates the buffer when
+  // the user is physically holding the phone near that orientation, so at
+  // each such moment the correct psi is simply whichever quarter-turn makes
+  // the picture level — i.e. minimizes |fusedRoll + psi|. Orientation
+  // events are used purely as "re-check now" triggers.
+  let bufferPsi = 0;            // buffer rotation vs device, degrees: 0|90|180|270
+  let reanchorPending = false;  // set by orientation events; handled after freeze
+
+  function wrapAngle(a) {
+    while (a > Math.PI)  a -= 2 * Math.PI;
+    while (a < -Math.PI) a += 2 * Math.PI;
+    return a;
+  }
+
+  function anchorBufferPsi(candidatesDeg) {
+    let best = bufferPsi;
+    let bestErr = Infinity;
+    for (const c of candidatesDeg) {
+      const err = Math.abs(wrapAngle(fusedRoll + c * DEG2RAD));
+      if (err < bestErr) { bestErr = err; best = c; }
     }
-    // Legacy fallback: window.orientation uses the OPPOSITE sign convention
-    // from screen.orientation.angle (e.g. -90 vs 270 for the same rotation),
-    // so normalize it into the modern convention before use.
-    if (typeof window.orientation === 'number') {
-      return (360 - window.orientation) % 360;
-    }
-    return 0;
+    bufferPsi = best;
   }
 
   function computeTargetRoll() {
     // Hold steady until the sensors have been seeded.
     if (!gravInit || !fusedInit) return smoothedRoll;
-
-    // The fused (gyro+accel) device-frame roll, compensated for the current
-    // screen rotation so the correction is relative to how the user is
-    // viewing the screen.
-    return fusedRoll - getScreenAngleDeg() * DEG2RAD;
+    return wrapAngle(fusedRoll + bufferPsi * DEG2RAD);
   }
 
   // Shortest-path angle interpolation. A naive lerp between e.g. +179° and
@@ -594,11 +618,115 @@
   });
 
   // =========================================================================
-  // 5. RENDER LOOP (WebGL, fixed 1920x1080 landscape frame)
+  // 5b. WORLD-ALIGNED PREVIEW PRESENTATION
   // =========================================================================
-  // The canvas never resizes (see OUT_WIDTH above), so there is no resize
-  // handler — CSS object-fit:contain letterboxes the fixed landscape frame
-  // on portrait screens, matching the real app's portrait view.
+  // The canvas CONTENT is always world-level (the shader guarantees it), so
+  // the preview only needs rotating when the SCREEN isn't level with the
+  // world. Two systems can rotate the view when the user turns the phone:
+  // the OS (if rotation is unlocked) and this sensor-driven flip. They must
+  // never both animate the same turn — that double-flip fight is exactly
+  // what looked awful. Priority rule:
+  //
+  //   THE OS OWNS THE FLIP WHENEVER IT'S WILLING TO ROTATE.
+  //   The sensor flip is only the fallback for cases the OS won't handle
+  //   (orientation lock enabled, or upside-down — which iOS never rotates to).
+  //
+  // Implementation: a sensor flip must be CONFIRMED by the physical angle
+  // dwelling past the threshold for FLIP_CONFIRM_MS. If OS rotation is
+  // unlocked, the OS rotates well within that window, the screen angle
+  // changes, and the pending sensor flip cancels — the user sees only the
+  // single native rotation. If rotation is locked, nothing preempts the
+  // timer and the sensor flip commits. No lock-detection needed.
+  const QUADRANT_HYSTERESIS_DEG = 12; // extra degrees past 45° before flipping
+  const FLIP_CONFIRM_MS = 800;        // dwell time before a sensor flip commits
+  let displayQuadrant = 0;   // snapped physical orientation: 0 | 90 | 180 | 270
+  let displayRotation = 0;   // continuous CSS rotation accumulator (deg) so
+                             // transitions always animate the short way round
+  let pendingQuadrant = null;
+  let pendingSince = 0;
+  let rollFreezeUntil = 0;   // ms timestamp; render roll is held during OS rotation
+
+  function layoutPreview() {
+    const vw = window.innerWidth;
+    const vh = window.innerHeight;
+
+    // Size the element to fit the 16:9 frame in the viewport upright...
+    const w0 = Math.min(vw, vh * OUT_ASPECT);
+    const h0 = w0 / OUT_ASPECT;
+
+    // ...and when shown sideways (quadrant 90/270), scale it so the rotated
+    // frame instead fits the swapped axes — filling a physically-landscape
+    // view even though the viewport is still portrait.
+    const w90 = Math.min(vh, vw * OUT_ASPECT);
+    const sideways = (displayQuadrant === 90 || displayQuadrant === 270);
+    const k = sideways ? (w90 / w0) : 1;
+
+    canvas.style.width  = w0 + 'px';
+    canvas.style.height = h0 + 'px';
+    canvas.style.transform =
+      'translate(-50%,-50%) rotate(' + displayRotation + 'deg) scale(' + k + ')';
+  }
+
+  function updateDisplayQuadrant(nowMs) {
+    const rollDeg = smoothedRoll * 180 / Math.PI;
+
+    // How far the physical roll has moved away from the currently shown
+    // quadrant (wrapped to -180..180).
+    const rel = ((rollDeg - displayQuadrant) % 360 + 540) % 360 - 180;
+
+    if (Math.abs(rel) > 45 + QUADRANT_HYSTERESIS_DEG) {
+      const q = ((Math.round(rollDeg / 90) * 90) % 360 + 360) % 360;
+      if (pendingQuadrant !== q) {
+        // New candidate orientation: start (or restart) the dwell timer.
+        pendingQuadrant = q;
+        pendingSince = nowMs;
+      } else if (nowMs - pendingSince >= FLIP_CONFIRM_MS) {
+        // Dwell confirmed and the OS didn't rotate -> sensor flip commits.
+        displayQuadrant = q;
+        const targetRotation = -displayQuadrant;
+        let delta = ((targetRotation - displayRotation) % 360 + 540) % 360 - 180;
+        displayRotation += delta; // shortest arc: always a quarter-turn
+        layoutPreview();
+        pendingQuadrant = null;
+      }
+    } else {
+      pendingQuadrant = null;
+    }
+  }
+
+  // OS rotation just happened: it owns this flip. Cancel any pending sensor
+  // flip, snap the preview to its natural upright state WITHOUT animating
+  // (the OS's own page-rotation animation must be the only visible motion),
+  // and briefly freeze the rendered roll so the camera-buffer swap and the
+  // screen-angle update — which never land on the same frame — can't jerk
+  // the content while the rotation settles.
+  function onOsRotation() {
+    pendingQuadrant = null;
+    rollFreezeUntil = performance.now() + 400;
+    // The event VALUE is never trusted — it's purely a trigger to re-anchor
+    // the buffer rotation from gravity once things settle. This catches
+    // 180° flips (landscape-left <-> landscape-right) where the buffer
+    // aspect doesn't change; quarter-turns are caught by the aspect flip.
+    reanchorPending = true;
+    if (displayQuadrant !== 0 || displayRotation !== 0) {
+      displayQuadrant = 0;
+      displayRotation = 0;
+      canvas.style.transition = 'none';
+      layoutPreview();
+      void canvas.offsetHeight; // force reflow so the snap isn't animated
+      canvas.style.transition = '';
+    } else {
+      layoutPreview();
+    }
+  }
+
+  if (screen.orientation && screen.orientation.addEventListener) {
+    screen.orientation.addEventListener('change', onOsRotation);
+  } else {
+    window.addEventListener('orientationchange', onOsRotation);
+  }
+  window.addEventListener('resize', layoutPreview);
+  layoutPreview();
 
   // One-time gravity sign calibration (see the explanation at gravitySign).
   // Runs on the first frame with a strong-enough in-plane gravity reading;
@@ -610,10 +738,11 @@
     // judge orientation reliably); try again next frame.
     if (Math.hypot(gravX, gravY) < 4.0) return;
     const roll = fusedInit ? fusedRoll : Math.atan2(gravX, gravY) * ROLL_SIGN;
-    const compensated = roll - getScreenAngleDeg() * DEG2RAD;
-    if (Math.cos(compensated) < 0) {
+    if (Math.cos(roll) < 0) {
       // Computed roll is closer to 180° than 0° while the user is holding
       // the phone normally -> this platform's gravity sign is inverted.
+      // (The psi anchor below would absorb a constant 180° on its own, but
+      // flipping here keeps fusedRoll human-interpretable for the HUD.)
       gravitySign = -1;
       gravX = -gravX;
       gravY = -gravY;
@@ -624,6 +753,11 @@
       gyroScore = 0;
       gyroSign = 0;
     }
+    // Initial buffer-rotation anchor: the user is facing the screen right
+    // now (they just tapped Start), so the correct psi is whichever
+    // quarter-turn levels the picture — considering all four, since the app
+    // may have been started with the UI already rotated to landscape.
+    anchorBufferPsi([0, 90, 180, 270]);
     signCalibrated = true;
   }
 
@@ -638,8 +772,30 @@
       // Recompute the horizon-lock rotation every frame. The heavy smoothing
       // happens on the gravity input (GRAVITY_SMOOTHING); this final lerp
       // is light, just to smooth the RAF/sensor timing mismatch.
-      const target = computeTargetRoll();
-      smoothedRoll = lerpAngle(smoothedRoll, target, 0.5);
+      const nowMs = performance.now();
+
+      // Recompute the horizon-lock rotation every frame — EXCEPT during the
+      // brief window right after an OS rotation, when the screen angle and
+      // the camera buffer update on different frames; holding the roll
+      // through that window prevents the content from visibly jerking.
+      if (nowMs >= rollFreezeUntil) {
+        // A pending orientation-event re-anchor is resolved here, after the
+        // freeze, when the buffer and sensors have settled. Same-parity
+        // candidates only: quarter-turns were already handled by the aspect
+        // flip; this catches pure 180° flips.
+        if (reanchorPending) {
+          anchorBufferPsi([bufferPsi, (bufferPsi + 180) % 360]);
+          smoothedRoll = computeTargetRoll();
+          reanchorPending = false;
+        }
+        const target = computeTargetRoll();
+        smoothedRoll = lerpAngle(smoothedRoll, target, 0.5);
+      }
+
+      // Keep the on-screen preview level with the physical world. Sensor
+      // flips only commit after a dwell, so the OS gets first claim on
+      // every rotation it's willing to handle.
+      updateDisplayQuadrant(nowMs);
 
       // --- Zoom -----------------------------------------------------------
       const srcAspect = video.videoWidth / video.videoHeight;
@@ -672,11 +828,16 @@
       }
 
       // --- Camera-buffer orientation swap resync ---------------------------
-      // When the browser rotates the camera buffer (portrait<->landscape),
-      // the content, srcAspect, and screen angle all jump in the same
-      // instant. Snapping the smoothed values to their targets on that frame
-      // collapses what would be a multi-frame wobble into a single frame.
+      // The buffer aspect just flipped: the OS rotated the camera feed by a
+      // quarter-turn, which also means the user is physically near that
+      // orientation — so gravity can now unambiguously pick which of the
+      // two parity-consistent quarter-turns the buffer took. Snapping the
+      // smoothed values on the same frame collapses the wobble, and this is
+      // also the event the post-OS-rotation roll freeze was waiting for.
       if (prevSrcAspect > 0 && Math.abs(srcAspect - prevSrcAspect) > 0.2) {
+        anchorBufferPsi([(bufferPsi + 90) % 360, (bufferPsi + 270) % 360]);
+        reanchorPending = false;
+        rollFreezeUntil = 0;
         smoothedRoll = computeTargetRoll();
         smoothedScale = targetScale;
       }
