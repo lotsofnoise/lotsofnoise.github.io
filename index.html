@@ -170,8 +170,8 @@
   // New Global State for WYSIWYG Recording
   const recCanvas = document.createElement('canvas');
   let recCtx = null;
-  let REC_WIDTH = 1080;
-  let REC_HEIGHT = 1920;
+  let REC_WIDTH = 1920;
+  let REC_HEIGHT = 1080;
 
   const DEG2RAD = Math.PI / 180;
   let gravX = 0;
@@ -524,7 +524,7 @@
 
       // --- WYSIWYG RECORDING RENDER ---
       // Replicate exact CSS transforms (scaling & rotation) from the visual output 
-      // onto a fixed 2D canvas strictly for MediaRecorder processing.
+      // onto a fixed 1920x1080 landscape canvas for MediaRecorder processing.
       if (isRecording && recCtx) {
         recCtx.fillStyle = '#000';
         recCtx.fillRect(0, 0, REC_WIDTH, REC_HEIGHT);
@@ -544,10 +544,9 @@
         
         recCtx.rotate(angle);
 
-        const f = previewFit();
-        const pxRatio = REC_WIDTH / window.innerWidth;
-        const drawW = f.wUp * scale * pxRatio;
-        const drawH = f.hUp * scale * pxRatio;
+        // Map the CSS scale directly back to the 1920x1080 internal buffer sizes
+        const drawW = OUT_WIDTH * scale;
+        const drawH = OUT_HEIGHT * scale;
 
         recCtx.drawImage(canvas, -drawW / 2, -drawH / 2, drawW, drawH);
         recCtx.restore();
@@ -637,10 +636,9 @@
   }
 
   function initRecCanvas() {
-    // Generate a fixed canvas size matching the exact screen aspect ratio dynamically
-    REC_WIDTH = 1080;
-    REC_HEIGHT = Math.round(REC_WIDTH * (window.innerHeight / window.innerWidth));
-    if (REC_HEIGHT % 2 !== 0) REC_HEIGHT += 1; // Encoders prefer even numbers
+    // Force a fixed 1920x1080 landscape canvas size, discarding dynamic portrait sizes
+    REC_WIDTH = OUT_WIDTH;
+    REC_HEIGHT = OUT_HEIGHT;
     recCanvas.width = REC_WIDTH;
     recCanvas.height = REC_HEIGHT;
     recCtx = recCanvas.getContext('2d', { alpha: false });
