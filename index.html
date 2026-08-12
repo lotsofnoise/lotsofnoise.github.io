@@ -158,9 +158,18 @@
 
   const DEG2RAD = Math.PI / 180;
 
-  // Raw sensor readings, updated by the deviceorientation listener.
-  let rawBeta = 0;   // front-back tilt, -180..180
-  let rawGamma = 0;  // left-right tilt, -90..90
+  // Raw gravity vector components in device-local coordinates, updated by
+  // the devicemotion listener. x = left/right axis of the device,
+  // y = top/bottom axis of the device (per the DeviceMotion spec).
+  let rawGX = 0;
+  let rawGY = 0;
+
+  // Flip this to -1 if the horizon rotates the WRONG direction on your
+  // specific device/browser (sign conventions for accelerationIncludingGravity
+  // have historically varied slightly across implementations). Test by
+  // tilting the phone clockwise — the video should visually counter-rotate
+  // to stay level. If it goes the wrong way, flip this constant.
+  const ROLL_SIGN = 1;
 
   // Smoothed rotation actually sent to the GPU (radians). Smoothing prevents
   // jittery, noisy sensor data from causing a shaky/flickering horizon.
@@ -316,18 +325,24 @@
   // 3. INVERSION-SHIELD SENSOR MATH
   // =========================================================================
   //
-  // The key insight: the direction of gravity relative to the DEVICE only
-  // depends on beta (front-back tilt) and gamma (left-right tilt) — it does
-  // NOT depend on alpha (compass heading), because alpha is a rotation about
-  // the same axis gravity points along. That means we can compute a gravity
-  // vector in device-space directly from beta/gamma, then take atan2() of
-  // its components to get a roll angle.
+  // NOTE ON APPROACH: an earlier version of this computed roll from the
+  // deviceorientation API's alpha/beta/gamma Euler angles. That formula
+  // assumes the device is roughly flat (like a tablet on a table), and it
+  // degrades badly right around beta≈90° — which is exactly the orientation
+  // a phone is in when held upright like a camera. That's why tilting felt
+  // "wonky": the math was breaking down in precisely the pose this app is
+  // meant to be used in.
   //
-  // Using atan2() instead of manual angle arithmetic is what makes this
-  // "flip-proof": atan2 sweeps smoothly and continuously through all 360
-  // degrees as the phone is rotated like a steering wheel, with no branch
-  // jumps, no snapping to quadrants, and no sudden inversion — unlike naive
-  // formulas that break down whenever beta crosses ±90 or ±180.
+  // The fix: use raw gravity directly. The devicemotion event's
+  // accelerationIncludingGravity gives the gravity vector's components along
+  // the device's own physical x/y/z axes — no Euler-angle conversion, no
+  // gimbal-lock zone, and it stays well-behaved in every orientation
+  // (flat, upright, landscape, upside-down, mid-spin). This is the same
+  // technique real bubble-level and horizon-lock apps use.
+  //
+  // atan2(x, y) of the gravity vector's screen-plane components gives a
+  // continuous roll angle with no branch jumps or snapping, which is what
+  // makes it flip-proof through a full 360° rotation.
   function getScreenAngleDeg() {
     // Prefer the modern Screen Orientation API (Android Chrome, etc.)
     if (screen.orientation && typeof screen.orientation.angle === 'number') {
@@ -341,21 +356,17 @@
   }
 
   function computeTargetRoll() {
-    const betaRad  = rawBeta * DEG2RAD;
-    const gammaRad = rawGamma * DEG2RAD;
+    // Guard against the brief window before the first devicemotion event
+    // has fired (both components exactly 0 would otherwise give atan2(0,0)).
+    if (rawGX === 0 && rawGY === 0) return smoothedRoll;
 
-    // Gravity vector components in device-local coordinates (alpha-independent).
-    const gx = Math.sin(gammaRad);
-    const gy = -Math.sin(betaRad) * Math.cos(gammaRad);
-
-    // atan2 gives a continuous angle in (-PI, PI] with no discontinuity as
-    // gravity sweeps a full circle around the device — this is what
-    // prevents the horizon from ever snapping or flipping.
-    let roll = Math.atan2(gx, -gy);
+    // atan2 of the gravity vector's screen-plane components. This alone is
+    // continuous through a full 360° rotation with no discontinuities.
+    let roll = Math.atan2(rawGX, rawGY) * ROLL_SIGN;
 
     // Compensate for the physical screen rotation (portrait vs landscape,
     // and landscape-left vs landscape-right) so the correction is always
-    // relative to how the user is actually holding/viewing the screen.
+    // relative to how the user is actually viewing the screen.
     roll -= getScreenAngleDeg() * DEG2RAD;
 
     return roll;
@@ -371,26 +382,29 @@
     return a + diff * t;
   }
 
-  function handleOrientation(evt) {
-    if (evt.beta === null || evt.gamma === null) return;
-    rawBeta = evt.beta;
-    rawGamma = evt.gamma;
+  function handleMotion(evt) {
+    const g = evt.accelerationIncludingGravity;
+    if (!g || g.x === null || g.y === null) return;
+    rawGX = g.x;
+    rawGY = g.y;
   }
 
   // =========================================================================
   // 4. PERMISSION HANDSHAKE (iOS 13+ requires a user gesture)
   // =========================================================================
   async function requestMotionPermission() {
-    if (typeof DeviceOrientationEvent !== 'undefined' &&
-        typeof DeviceOrientationEvent.requestPermission === 'function') {
-      // iOS Safari: MUST be called directly inside a user tap handler.
-      const result = await DeviceOrientationEvent.requestPermission();
+    // iOS Safari (13+) gates DeviceMotionEvent behind its own explicit
+    // permission prompt, separate from DeviceOrientationEvent's. Both MUST
+    // be called directly inside a user tap handler or iOS silently denies them.
+    if (typeof DeviceMotionEvent !== 'undefined' &&
+        typeof DeviceMotionEvent.requestPermission === 'function') {
+      const result = await DeviceMotionEvent.requestPermission();
       if (result !== 'granted') {
         throw new Error('Motion sensor permission was denied. The horizon lock cannot function without it.');
       }
     }
     // Android / other browsers: no explicit permission step required.
-    window.addEventListener('deviceorientation', handleOrientation, true);
+    window.addEventListener('devicemotion', handleMotion, true);
   }
 
   async function requestCameraAndMic() {
@@ -459,7 +473,10 @@
 
       gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
 
-      // HUD readout (degrees, 0.0 = perfectly level)
+      // HUD readout (degrees, 0.0 = perfectly level). If tilting the phone
+      // clockwise makes this number move the wrong way, or the video visibly
+      // rotates WITH the phone instead of counter-rotating to stay level,
+      // flip the ROLL_SIGN constant above and reload.
       const deg = (-smoothedRoll * 180 / Math.PI);
       tiltReadout.textContent = deg.toFixed(1) + '°';
     }
