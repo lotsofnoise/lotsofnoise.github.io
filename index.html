@@ -735,10 +735,15 @@
     const hUp = wUp / OUT_ASPECT;
     // Sideways (landscape) fill: rotated frame fills using the long side.
     const sideways = Math.max(vw / hUp, vh / wUp);
-    // Upright (portrait) fill: scale the landscape frame up until it fills the
-    // tall screen. This crops the frame's left/right edges in the PREVIEW only
-    // (the recording still captures the full landscape frame).
-    const portrait = Math.max(vw / wUp, vh / hUp);
+    // Upright (portrait) zoom. Full-fill (Math.max(vw/wUp, vh/hUp)) is ~3.85x
+    // on a tall phone, which is very tight. Cap it to a gentler PORTRAIT_ZOOM
+    // so you see more of the frame; the leftover is black bars top/bottom.
+    //   1.0  = the old letterbox strip
+    //   ~3.85 = completely fills the screen (very zoomed)
+    // 1.8 sits in between: noticeably fuller than the strip, not tight.
+    const PORTRAIT_ZOOM = 1.8;
+    const portraitFull = Math.max(vw / wUp, vh / hUp);
+    const portrait = Math.min(PORTRAIT_ZOOM, portraitFull);
     return { wUp: wUp, hUp: hUp, sideways: sideways, portrait: portrait };
   }
 
