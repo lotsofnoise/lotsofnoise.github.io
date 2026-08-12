@@ -9,7 +9,7 @@
 <link rel="manifest" href="manifest.json">
 <meta name="theme-color" content="#000000">
 
-<!-- iOS "Add to Home Screen" support (Safari ignores manifest.json for these) -->
+<!-- iOS "Add to Home Screen" support -->
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <meta name="apple-mobile-web-app-title" content="Horizon">
@@ -27,11 +27,10 @@
     touch-action:none;
   }
 
-  /* Hidden <video> element — used purely as a WebGL texture source, never shown directly */
+  /* Hidden <video> element — texture source for WebGL */
   #srcVideo { position:absolute; width:1px; height:1px; opacity:0; pointer-events:none; }
 
-  /* The visible output — a FIXED landscape (16:9) frame, letterboxed on
-     portrait screens exactly like the real Horizon app's portrait view */
+  /* Canvas frame — fixed aspect, scaled and rotated via CSS preview transform */
   #glCanvas {
     position:fixed; top:50%; left:50%;
     display:block; background:#000;
@@ -107,13 +106,9 @@
 </head>
 <body>
 
-  <!-- Camera feed source -->
   <video id="srcVideo" playsinline muted autoplay></video>
-
-  <!-- WebGL render target -->
   <canvas id="glCanvas"></canvas>
 
-  <!-- HUD overlay -->
   <div id="hud">
     <div id="tiltReadout">0.0°</div>
     <div id="recStatus"><span id="recDot"></span>REC <span id="recTime">00:00</span></div>
@@ -124,7 +119,6 @@
     </div>
   </div>
 
-  <!-- Start / permission-handshake overlay -->
   <div id="startOverlay">
     <h1>Horizon Level Camera</h1>
     <p>Locks the video to true horizontal, no matter how the phone is rotated. Tap below to grant camera, microphone, and motion sensor access.</p>
@@ -137,9 +131,6 @@
 (function () {
   'use strict';
 
-  // =========================================================================
-  // 0. SERVICE WORKER REGISTRATION
-  // =========================================================================
   if ('serviceWorker' in navigator) {
     window.addEventListener('load', () => {
       navigator.serviceWorker.register('service-worker.js').catch((err) => {
@@ -154,9 +145,6 @@
     document.getElementById('installHint').classList.add('show');
   }
 
-  // =========================================================================
-  // 1. GLOBAL STATE
-  // =========================================================================
   const video   = document.getElementById('srcVideo');
   const canvas  = document.getElementById('glCanvas');
   const overlay = document.getElementById('startOverlay');
@@ -172,13 +160,11 @@
   let gravX = 0;
   let gravY = 0;
   let gravInit = false;
-
   const GRAVITY_SMOOTHING = 0.1;
 
   let fusedRoll = 0;
   let fusedInit = false;
   let lastMotionT = 0;
-
   const ACCEL_CORRECTION = 0.02;
 
   let gyroSign = 0;
@@ -208,9 +194,6 @@
   let recStartTime = 0;
   let recTimerHandle = null;
 
-  // =========================================================================
-  // 2. WEBGL SETUP
-  // =========================================================================
   const gl = canvas.getContext('webgl', { antialias: false, preserveDrawingBuffer: false })
           || canvas.getContext('experimental-webgl');
 
@@ -317,9 +300,6 @@
   gl.viewport(0, 0, OUT_WIDTH, OUT_HEIGHT);
   gl.uniform1f(uOutAspectLoc, OUT_ASPECT);
 
-  // =========================================================================
-  // 3. SENSOR MATH
-  // =========================================================================
   function computeTargetRoll() {
     if (!gravInit || !fusedInit) return smoothedRoll;
     return fusedRoll;
@@ -387,9 +367,6 @@
     }
   }
 
-  // =========================================================================
-  // 4. PERMISSION HANDSHAKE
-  // =========================================================================
   async function requestMotionPermission() {
     if (typeof DeviceMotionEvent !== 'undefined' &&
         typeof DeviceMotionEvent.requestPermission === 'function') {
@@ -437,9 +414,6 @@
     }
   });
 
-  // =========================================================================
-  // 5. RENDER LOOP (WebGL)
-  // =========================================================================
   function calibrateGravitySign() {
     if (signCalibrated || !gravInit) return;
     if (Math.hypot(gravX, gravY) < 4.0) return;
@@ -560,7 +534,8 @@
 
     if (Math.abs(rel) > 45 + PREVIEW_HYSTERESIS) {
       const q = ((Math.round(physical / 90) * 90) % 360 + 360) % 360;
-      const targetCss = q;
+      // Invert sign (-q) so canvas top aligns upright when held sideways
+      const targetCss = -q;
       let delta = ((targetCss - previewCssRotation) % 360 + 540) % 360 - 180;
       previewCssRotation += delta;
       previewQuadrant = q;
@@ -577,9 +552,6 @@
   });
   applyPreview(0, 1, false);
 
-  // =========================================================================
-  // 6. RECORDING ENGINE
-  // =========================================================================
   function pickSupportedMimeType() {
     const candidates = [
       'video/mp4;codecs=avc1,mp4a.40.2',
