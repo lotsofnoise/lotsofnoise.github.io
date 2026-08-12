@@ -94,7 +94,7 @@
     font-size:11px; font-weight:700; letter-spacing:1px;
   }
   #zoomModeBtn.auto { color:#7fd4ff; border-color:rgba(127,212,255,0.5); }
-  #bottomSpacer { width:72px; } /* mirrors the toggle so the record button stays centered */
+  #bottomSpacer { width:72px; }
   #recStatus {
     position:absolute; top:calc(env(safe-area-inset-top, 20px) + 44px);
     left:50%; transform:translateX(-50%);
@@ -107,10 +107,10 @@
 </head>
 <body>
 
-  <!-- Camera feed source (invisible, feeds pixels into the WebGL texture) -->
+  <!-- Camera feed source -->
   <video id="srcVideo" playsinline muted autoplay></video>
 
-  <!-- WebGL render target: this is what the user actually sees -->
+  <!-- WebGL render target -->
   <canvas id="glCanvas"></canvas>
 
   <!-- HUD overlay -->
@@ -124,7 +124,7 @@
     </div>
   </div>
 
-  <!-- Start / permission-handshake overlay (required for iOS Safari motion sensors) -->
+  <!-- Start / permission-handshake overlay -->
   <div id="startOverlay">
     <h1>Horizon Level Camera</h1>
     <p>Locks the video to true horizontal, no matter how the phone is rotated. Tap below to grant camera, microphone, and motion sensor access.</p>
@@ -137,9 +137,6 @@
 (function () {
   'use strict';
 
-  // =========================================================================
-  // 0. PWA: SERVICE WORKER REGISTRATION
-  // =========================================================================
   if ('serviceWorker' in navigator) {
     window.addEventListener('load', () => {
       navigator.serviceWorker.register('service-worker.js').catch((err) => {
@@ -154,9 +151,6 @@
     document.getElementById('installHint').classList.add('show');
   }
 
-  // =========================================================================
-  // 1. GLOBAL STATE
-  // =========================================================================
   const video   = document.getElementById('srcVideo');
   const canvas  = document.getElementById('glCanvas');
   const overlay = document.getElementById('startOverlay');
@@ -167,13 +161,8 @@
   const recTimeEl = document.getElementById('recTime');
   const tiltReadout = document.getElementById('tiltReadout');
 
-  // New Global State for WYSIWYG Recording
-  const recCanvas = document.createElement('canvas');
-  let recCtx = null;
-  let REC_WIDTH = 1920;
-  let REC_HEIGHT = 1080;
-
   const DEG2RAD = Math.PI / 180;
+
   let gravX = 0;
   let gravY = 0;
   let gravInit = false; 
@@ -210,9 +199,6 @@
   let recStartTime = 0;
   let recTimerHandle = null;
 
-  // =========================================================================
-  // 2. WEBGL SETUP
-  // =========================================================================
   const gl = canvas.getContext('webgl', { antialias: false, preserveDrawingBuffer: false })
           || canvas.getContext('experimental-webgl');
 
@@ -319,19 +305,6 @@
   gl.viewport(0, 0, OUT_WIDTH, OUT_HEIGHT);
   gl.uniform1f(uOutAspectLoc, OUT_ASPECT);
 
-  // =========================================================================
-  // 3. INVERSION-SHIELD SENSOR MATH
-  // =========================================================================
-  function getScreenAngleDeg() {
-    if (screen.orientation && typeof screen.orientation.angle === 'number') {
-      return screen.orientation.angle;
-    }
-    if (typeof window.orientation === 'number') {
-      return (360 - window.orientation) % 360;
-    }
-    return 0;
-  }
-
   function computeTargetRoll() {
     if (!gravInit || !fusedInit) return smoothedRoll;
     return fusedRoll;
@@ -399,9 +372,6 @@
     }
   }
 
-  // =========================================================================
-  // 4. PERMISSION HANDSHAKE
-  // =========================================================================
   async function requestMotionPermission() {
     if (typeof DeviceMotionEvent !== 'undefined' &&
         typeof DeviceMotionEvent.requestPermission === 'function') {
@@ -449,9 +419,6 @@
     }
   });
 
-  // =========================================================================
-  // 5. RENDER LOOP
-  // =========================================================================
   function calibrateGravitySign() {
     if (signCalibrated || !gravInit) return;
     if (Math.hypot(gravX, gravY) < 4.0) return;
@@ -521,104 +488,35 @@
       tiltReadout.textContent = deg.toFixed(1) + '°';
 
       updatePreview();
-
-      // --- WYSIWYG RECORDING RENDER ---
-      // Replicate exact CSS transforms (scaling & rotation) from the visual output 
-      // onto a fixed 1920x1080 landscape canvas for MediaRecorder processing.
-      if (isRecording && recCtx) {
-        recCtx.fillStyle = '#000';
-        recCtx.fillRect(0, 0, REC_WIDTH, REC_HEIGHT);
-        recCtx.save();
-        recCtx.translate(REC_WIDTH / 2, REC_HEIGHT / 2);
-
-        const style = window.getComputedStyle(canvas);
-        let scale = 1;
-        let angle = 0;
-        
-        // Extract matrix from CSS engine to ensure pixel-perfect mid-animation sync
-        if (style.transform && style.transform !== 'none') {
-          const matrix = new DOMMatrix(style.transform);
-          scale = Math.sqrt(matrix.a * matrix.a + matrix.b * matrix.b);
-          angle = Math.atan2(matrix.b, matrix.a);
-        }
-        
-        recCtx.rotate(angle);
-
-        // Map the CSS scale directly back to the 1920x1080 internal buffer sizes
-        const drawW = OUT_WIDTH * scale;
-        const drawH = OUT_HEIGHT * scale;
-
-        recCtx.drawImage(canvas, -drawW / 2, -drawH / 2, drawW, drawH);
-        recCtx.restore();
-      }
     }
 
     requestAnimationFrame(renderLoop);
   }
-
-  let previewQuadrant = 0;      
-  let previewCssRotation = 0;   
-  const PREVIEW_HYSTERESIS = 18; 
 
   function previewFit() {
     const vw = window.innerWidth;
     const vh = window.innerHeight;
     const wUp = Math.min(vw, vh * OUT_ASPECT);
     const hUp = wUp / OUT_ASPECT;
-    const sideways = Math.max(vw / hUp, vh / wUp);
-    return { wUp: wUp, hUp: hUp, sideways: sideways };
+    return { wUp: wUp, hUp: hUp };
   }
 
-  function applyPreview(rotDeg, scale, animate) {
+  function applyPreview() {
     const f = previewFit();
     canvas.style.width  = f.wUp + 'px';
     canvas.style.height = f.hUp + 'px';
-    const end = 'translate(-50%,-50%) rotate(' + rotDeg + 'deg) scale(' + scale + ')';
-    if (animate) {
-      const midScale = Math.max(scale, canvas._lastScale || 1) * 1.25;
-      const midRot = ((canvas._lastRot || 0) + rotDeg) / 2;
-      canvas.animate(
-        [
-          { transform: 'translate(-50%,-50%) rotate(' + (canvas._lastRot || 0) + 'deg) scale(' + (canvas._lastScale || 1) + ')' },
-          { transform: 'translate(-50%,-50%) rotate(' + midRot + 'deg) scale(' + midScale + ')', offset: 0.5 },
-          { transform: end }
-        ],
-        { duration: 420, easing: 'ease-in-out', fill: 'none' }
-      );
-    }
-    canvas.style.transform = end;
-    canvas._lastRot = rotDeg;
-    canvas._lastScale = scale;
+    canvas.style.transform = 'translate(-50%,-50%)';
   }
 
   function updatePreview() {
-    if (!fusedInit) { applyPreview(0, 1, false); return; }
-
-    const physical = fusedRoll * 180 / Math.PI;
-    const rel = ((physical - previewQuadrant) % 360 + 540) % 360 - 180;
-
-    if (Math.abs(rel) > 45 + PREVIEW_HYSTERESIS) {
-      const q = ((Math.round(physical / 90) * 90) % 360 + 360) % 360;
-      const targetCss = q;
-      let delta = ((targetCss - previewCssRotation) % 360 + 540) % 360 - 180;
-      previewCssRotation += delta;
-      previewQuadrant = q;
-      const sideways = (q === 90 || q === 270);
-      const f = previewFit();
-      applyPreview(previewCssRotation, sideways ? f.sideways : 1, true);
-    }
+    applyPreview();
   }
 
   window.addEventListener('resize', function () {
-    const sideways = (previewQuadrant === 90 || previewQuadrant === 270);
-    const f = previewFit();
-    applyPreview(previewCssRotation, sideways ? f.sideways : 1, false);
+    applyPreview();
   });
-  applyPreview(0, 1, false);
+  applyPreview();
 
-  // =========================================================================
-  // 6. LOCAL RECORDING ENGINE
-  // =========================================================================
   function pickSupportedMimeType() {
     const candidates = [
       'video/mp4;codecs=avc1,mp4a.40.2', 
@@ -635,25 +533,14 @@
     return ''; 
   }
 
-  function initRecCanvas() {
-    // Force a fixed 1920x1080 landscape canvas size, discarding dynamic portrait sizes
-    REC_WIDTH = OUT_WIDTH;
-    REC_HEIGHT = OUT_HEIGHT;
-    recCanvas.width = REC_WIDTH;
-    recCanvas.height = REC_HEIGHT;
-    recCtx = recCanvas.getContext('2d', { alpha: false });
-  }
-
   function startRecording() {
-    initRecCanvas();
-
-    if (!recCanvas.captureStream) {
+    if (!canvas.captureStream) {
       fatalError('This browser does not support canvas.captureStream().');
       return;
     }
 
-    // Capture the 2D replication of what the user literally sees
-    const canvasStream = recCanvas.captureStream(30);
+    // Directly capture the stable 1920x1080 landscape canvas stream
+    const canvasStream = canvas.captureStream(30);
     if (audioTrack) {
       canvasStream.addTrack(audioTrack);
     }
