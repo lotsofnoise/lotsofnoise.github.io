@@ -32,11 +32,7 @@
 
   /* The visible output — a FIXED landscape (16:9) frame, letterboxed on
      portrait screens exactly like the real Horizon app's portrait view */
-  #glCanvas {
-    position:fixed; top:50%; left:50%;
-    display:block; background:#000;
-    transform-origin:center center;
-  }
+  #glCanvas { position:fixed; top:0; left:0; width:100vw; height:100vh; display:block; background:#000; object-fit:contain; }
 
   /* ---------- PERMISSION / START OVERLAY ---------- */
   #startOverlay {
@@ -67,10 +63,9 @@
   }
   #tiltReadout {
     align-self:center; margin-top:env(safe-area-inset-top, 20px);
-    background:rgba(0,0,0,0.55); color:#ffcc00;
-    font-variant-numeric:tabular-nums; font-size:11px; font-weight:600;
-    font-family:ui-monospace, Menlo, monospace;
-    padding:5px 10px; border-radius:14px; letter-spacing:0; max-width:96vw;
+    background:rgba(0,0,0,0.4); color:#ffcc00;
+    font-variant-numeric:tabular-nums; font-size:14px; font-weight:600;
+    padding:6px 16px; border-radius:20px; letter-spacing:1px;
   }
   #bottomBar {
     display:flex; align-items:center; justify-content:center;
@@ -95,6 +90,7 @@
     font-size:11px; font-weight:700; letter-spacing:1px;
   }
   #zoomModeBtn.auto { color:#7fd4ff; border-color:rgba(127,212,255,0.5); }
+  #bottomSpacer { width:72px; } /* mirrors the toggle so the record button stays centered */
   #recStatus {
     position:absolute; top:calc(env(safe-area-inset-top, 20px) + 44px);
     left:50%; transform:translateX(-50%);
@@ -118,8 +114,9 @@
     <div id="tiltReadout">0.0°</div>
     <div id="recStatus"><span id="recDot"></span>REC <span id="recTime">00:00</span></div>
     <div id="bottomBar">
-      <button id="zoomModeBtn" aria-label="Zoom mode">AUTO</button>
+      <button id="zoomModeBtn" aria-label="Zoom mode">LOCKED</button>
       <button id="recordBtn" aria-label="Record"></button>
+      <div id="bottomSpacer"></div>
     </div>
   </div>
 
@@ -220,7 +217,7 @@
   //             permanently tighter crop.
   // 'dynamic' = zoom breathes with the angle for maximum field of view at
   //             every tilt (what the previous version did).
-  let zoomLocked = false;
+  let zoomLocked = true;
   let lockedZoomAspect = 0;   // srcAspect the cached locked value was computed for
   let lockedZoomValue = 1;
   let prevSrcAspect = 0;      // for detecting camera-buffer orientation swaps
@@ -252,10 +249,6 @@
   // Smoothed rotation actually sent to the GPU (radians). Smoothing prevents
   // jittery, noisy sensor data from causing a shaky/flickering horizon.
   let smoothedRoll = 0;
-
-  // Direction of the horizon counter-rotation. +1 is the corrected default
-  // for this device (a landscape screenshot at 88° confirmed -1 rendered
-  // upside-down); the FLIP button switches it if ever needed.
 
   // Smoothed dynamic zoom. The raw cover-zoom is already a continuous
   // function of the roll angle; this light smoothing additionally hides the
@@ -454,14 +447,18 @@
     // Hold steady until the sensors have been seeded.
     if (!gravInit || !fusedInit) return smoothedRoll;
 
-    // Level to gravity. The counter-rotation direction is the NEGATIVE of the
-    // gravity roll here: with the previous (positive) direction the image came
-    // out correct in portrait but upside-down in landscape, which is the exact
-    // signature of the rotation going the wrong way (the error is zero at 0°
-    // and a full half-turn at 90°). Negating fixes landscape while leaving
-    // portrait untouched (a ~0° tilt negated is still ~0°), and it's smooth —
-    // no flip, no discontinuity through the turn.
-    return -fusedRoll;
+    // Level purely to gravity. fusedRoll is derived from the gravity vector
+    // via atan2, so it moves smoothly and continuously from 0° (portrait) to
+    // ~90° (landscape) — the shader's -fusedRoll counter-rotation therefore
+    // stays level the whole way with NO sudden flip.
+    //
+    // The previous version subtracted getScreenAngleDeg(). That value is the
+    // ONE thing in this pipeline that jumps 180° the instant the phone goes
+    // sideways on a home-screen web app (the browser reports it wrong there),
+    // which is exactly the "upright in portrait, upside-down the moment I turn
+    // sideways" symptom. Removing it fixes landscape and leaves portrait
+    // unchanged (screen angle was 0 there anyway).
+    return fusedRoll;
   }
 
   // Shortest-path angle interpolation. A naive lerp between e.g. +179° and
@@ -621,6 +618,7 @@
     // judge orientation reliably); try again next frame.
     if (Math.hypot(gravX, gravY) < 4.0) return;
     const roll = fusedInit ? fusedRoll : Math.atan2(gravX, gravY) * ROLL_SIGN;
+    // Gravity-only, matching computeTargetRoll (no screen-angle term).
     const compensated = roll;
     if (Math.cos(compensated) < 0) {
       // Computed roll is closer to 180° than 0° while the user is holding
@@ -701,64 +699,15 @@
 
       gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
 
-      // Live diagnostic readout — the real device values, so the orientation
-      // fix can be based on your hardware instead of assumptions. Reads:
-      //   g  = raw gravity vector (device frame)
-      //   f  = fused physical roll (deg)   scr = browser screen angle (deg)
-      //   buf = camera buffer WxH (tells us if the buffer is portrait/landscape)
+      // HUD readout (degrees, 0.0 = perfectly level). If tilting the phone
+      // clockwise makes the image visibly rotate WITH the phone instead of
+      // counter-rotating to stay level, flip ROLL_SIGN above and reload.
       const deg = (-smoothedRoll * 180 / Math.PI);
-      const scrAng = (screen.orientation && typeof screen.orientation.angle === 'number')
-        ? screen.orientation.angle
-        : (typeof window.orientation === 'number' ? window.orientation : '?');
-      tiltReadout.textContent =
-        'g ' + gravX.toFixed(1) + ',' + gravY.toFixed(1) +
-        '  f ' + (fusedRoll * 180 / Math.PI).toFixed(0) + '°' +
-        '  scr ' + scrAng +
-        '  buf ' + video.videoWidth + 'x' + video.videoHeight;
-
-      // --- PREVIEW ROTATION (display only — does NOT touch the recording) ---
-      // The recorded canvas is already correct in every orientation. This
-      // block only rotates how that canvas is DISPLAYED on screen, so when
-      // you physically turn the phone to landscape you SEE a landscape-filling
-      // preview instead of the small letterboxed strip. It reads the phone's
-      // true physical roll (fusedRoll) — the same reliable value the horizon
-      // lock uses — snaps it to the nearest quarter-turn with hysteresis so
-      // it never flickers at the boundary, and applies that as a CSS
-      // transform. Nothing here feeds back into the shader or the recorder.
-      updatePreviewOrientation();
+      tiltReadout.textContent = deg.toFixed(1) + '°';
     }
 
     requestAnimationFrame(renderLoop);
   }
-
-  // Continuous zoom preview: the canvas scales in and out LIVE as a direct
-  // function of the tilt angle, every frame — the original "breathing" effect.
-  // No quadrant snapping, no flip animation. The scale is exactly the cover
-  // amount for the current roll, so as you tilt, the frame zooms in through
-  // the diagonal and back out — tracking every degree.
-  function updatePreviewOrientation() {
-    const vw = window.innerWidth;
-    const vh = window.innerHeight;
-    const wUp = Math.min(vw, vh * OUT_ASPECT);
-    const hUp = wUp / OUT_ASPECT;
-
-    // Roll the preview by the live smoothed angle (radians -> deg) and zoom to
-    // cover so no black corners ever show. Both update every frame.
-    const rotDeg = -smoothedRoll * 180 / Math.PI;
-    const a = smoothedRoll;
-    const ca = Math.abs(Math.cos(a));
-    const sa = Math.abs(Math.sin(a));
-    const bx = (vw / 2) * ca + (vh / 2) * sa;
-    const by = (vw / 2) * sa + (vh / 2) * ca;
-    const scale = Math.max((2 * bx) / wUp, (2 * by) / hUp);
-
-    canvas.style.width  = wUp + 'px';
-    canvas.style.height = hUp + 'px';
-    canvas.style.transform =
-      'translate(-50%, -50%) rotate(' + rotDeg + 'deg) scale(' + scale + ')';
-  }
-
-  updatePreviewOrientation();
 
   // =========================================================================
   // 6. LOCAL RECORDING ENGINE (MediaRecorder -> Web Share -> Files/iCloud)
@@ -881,7 +830,6 @@
   // gimbal-like, default) <-> AUTO (dynamic zoom, maximum field of view,
   // visible breathing as the angle changes).
   const zoomModeBtn = document.getElementById('zoomModeBtn');
-  zoomModeBtn.classList.toggle('auto', !zoomLocked); // reflect default on load
   zoomModeBtn.addEventListener('click', function () {
     zoomLocked = !zoomLocked;
     zoomModeBtn.textContent = zoomLocked ? 'LOCKED' : 'AUTO';
