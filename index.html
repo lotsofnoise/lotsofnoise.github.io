@@ -30,15 +30,13 @@
   /* Hidden <video> element — used purely as a WebGL texture source, never shown directly */
   #srcVideo { position:absolute; width:1px; height:1px; opacity:0; pointer-events:none; }
 
-  /* The visible output — a FIXED landscape (16:9) frame. Its on-screen
-     size and rotation are driven from JS so the preview always appears
-     level with the physical world, even when the OS orientation lock
-     prevents the browser UI itself from rotating. */
+  /* The visible output — a FIXED landscape (16:9) frame, letterboxed on
+     portrait screens exactly like the real Horizon app's portrait view */
   #glCanvas {
     position:fixed; top:50%; left:50%;
-    background:#000;
+    display:block; background:#000;
     transform-origin:center center;
-    transition: transform 0.35s cubic-bezier(0.22, 1, 0.36, 1);
+    transition: transform 0.4s cubic-bezier(0.22, 1, 0.36, 1);
   }
 
   /* ---------- PERMISSION / START OVERLAY ---------- */
@@ -97,21 +95,7 @@
     font-size:11px; font-weight:700; letter-spacing:1px;
   }
   #zoomModeBtn.auto { color:#7fd4ff; border-color:rgba(127,212,255,0.5); }
-  #rotateFixBtn {
-    width:72px; padding:8px 0; border-radius:16px;
-    background:rgba(0,0,0,0.45); color:#fff;
-    border:1px solid rgba(255,255,255,0.5);
-    font-size:13px; font-weight:700; letter-spacing:0.5px;
-  }
-  #rotateFixBtn:active { transform:scale(0.94); }
-  #debugPanel {
-    position:fixed; top:calc(env(safe-area-inset-top, 20px) + 76px); left:50%;
-    transform:translateX(-50%); z-index:20;
-    background:rgba(0,0,0,0.62); color:#0f0;
-    font-family:ui-monospace, Menlo, monospace; font-size:11px; line-height:1.5;
-    padding:8px 12px; border-radius:10px; white-space:pre; pointer-events:auto;
-    text-align:left;
-  }
+  #bottomSpacer { width:72px; } /* mirrors the toggle so the record button stays centered */
   #recStatus {
     position:absolute; top:calc(env(safe-area-inset-top, 20px) + 44px);
     left:50%; transform:translateX(-50%);
@@ -130,10 +114,6 @@
   <!-- WebGL render target: this is what the user actually sees -->
   <canvas id="glCanvas"></canvas>
 
-  <!-- Live debug readout: the real on-device numbers, so fixes are based on
-       your hardware instead of assumptions. Tap it to hide. -->
-  <div id="debugPanel"></div>
-
   <!-- HUD overlay -->
   <div id="hud">
     <div id="tiltReadout">0.0°</div>
@@ -141,7 +121,7 @@
     <div id="bottomBar">
       <button id="zoomModeBtn" aria-label="Zoom mode">LOCKED</button>
       <button id="recordBtn" aria-label="Record"></button>
-      <button id="rotateFixBtn" aria-label="Rotate correction">↻ 90°</button>
+      <div id="bottomSpacer"></div>
     </div>
   </div>
 
@@ -245,6 +225,7 @@
   let zoomLocked = true;
   let lockedZoomAspect = 0;   // srcAspect the cached locked value was computed for
   let lockedZoomValue = 1;
+  let prevSrcAspect = 0;      // for detecting camera-buffer orientation swaps
 
   // --- GRAVITY SIGN AUTO-CALIBRATION (fixes the upside-down recording) -----
   // Platforms disagree on the sign convention of accelerationIncludingGravity,
@@ -452,37 +433,29 @@
   // atan2(x, y) of the gravity vector's screen-plane components gives a
   // continuous roll angle with no branch jumps or snapping, which is what
   // makes it flip-proof through a full 360° rotation.
-  // =========================================================================
-  // 3b. BUFFER ROTATION ANCHORING (replaces screen-angle compensation)
-  // =========================================================================
-  // The shader needs the camera buffer's rotation relative to the WORLD:
-  //   buffer-vs-world = device-vs-world (fusedRoll) + buffer-vs-device (psi)
-  // psi is always a multiple of 90°, but reading it from the orientation
-  // APIs proved unreliable: sign conventions differ between APIs and
-  // platforms, and in iOS home-screen (standalone PWA) mode the reported
-  // angle can simply stay 0 while the camera buffer still rotates — which
-  // made landscape render sideways while portrait worked perfectly.
-  //
-  // So the API's VALUE is never used. Instead, psi is inferred from gravity
-  // at moments when it is unambiguous: the OS only rotates the buffer when
-  // the user is physically holding the phone near that orientation, so at
-  // each such moment the correct psi is simply whichever quarter-turn makes
-  // the picture level — i.e. minimizes |fusedRoll + psi|. Orientation
-  // events are used purely as "re-check now" triggers.
-  function wrapAngle(a) {
-    while (a > Math.PI)  a -= 2 * Math.PI;
-    while (a < -Math.PI) a += 2 * Math.PI;
-    return a;
+  function getScreenAngleDeg() {
+    // Prefer the modern Screen Orientation API (Android Chrome, and
+    // iOS Safari 16.4+, so this is the path virtually all modern devices take).
+    if (screen.orientation && typeof screen.orientation.angle === 'number') {
+      return screen.orientation.angle;
+    }
+    // Legacy fallback: window.orientation uses the OPPOSITE sign convention
+    // from screen.orientation.angle (e.g. -90 vs 270 for the same rotation),
+    // so normalize it into the modern convention before use.
+    if (typeof window.orientation === 'number') {
+      return (360 - window.orientation) % 360;
+    }
+    return 0;
   }
 
-  // Manual orientation offset (degrees, multiple of 90) set by the "↻ 90°"
-  // button. This is the ONLY orientation control now — no auto-detection,
-  // which is what kept regressing. If portrait films upside-down, tap once.
-  let manualOffset = 0;
-
   function computeTargetRoll() {
+    // Hold steady until the sensors have been seeded.
     if (!gravInit || !fusedInit) return smoothedRoll;
-    return wrapAngle(fusedRoll + manualOffset * DEG2RAD);
+
+    // The fused (gyro+accel) device-frame roll, compensated for the current
+    // screen rotation so the correction is relative to how the user is
+    // viewing the screen.
+    return fusedRoll - getScreenAngleDeg() * DEG2RAD;
   }
 
   // Shortest-path angle interpolation. A naive lerp between e.g. +179° and
@@ -626,22 +599,11 @@
   });
 
   // =========================================================================
-  // 5b. PORTRAIT-LOCKED PREVIEW
+  // 5. RENDER LOOP (WebGL, fixed 1920x1080 landscape frame)
   // =========================================================================
-  // Orientation auto-detection was removed: it was the source of the
-  // regressions. The canvas simply fills the screen. The horizon still
-  // levels; if portrait ever shows upside-down, the "↻ 90°" button applies a
-  // fixed 90° correction (see manualOffset) that is remembered for the
-  // session. rollFreezeUntil is retained as a harmless no-op anchor.
-  let rollFreezeUntil = 0;
-
-  function layoutPreview() {
-    canvas.style.width  = window.innerWidth + 'px';
-    canvas.style.height = window.innerHeight + 'px';
-    canvas.style.transform = 'translate(-50%,-50%)';
-  }
-  window.addEventListener('resize', layoutPreview);
-  layoutPreview();
+  // The canvas never resizes (see OUT_WIDTH above), so there is no resize
+  // handler — CSS object-fit:contain letterboxes the fixed landscape frame
+  // on portrait screens, matching the real app's portrait view.
 
   // One-time gravity sign calibration (see the explanation at gravitySign).
   // Runs on the first frame with a strong-enough in-plane gravity reading;
@@ -653,11 +615,10 @@
     // judge orientation reliably); try again next frame.
     if (Math.hypot(gravX, gravY) < 4.0) return;
     const roll = fusedInit ? fusedRoll : Math.atan2(gravX, gravY) * ROLL_SIGN;
-    if (Math.cos(roll) < 0) {
+    const compensated = roll - getScreenAngleDeg() * DEG2RAD;
+    if (Math.cos(compensated) < 0) {
       // Computed roll is closer to 180° than 0° while the user is holding
       // the phone normally -> this platform's gravity sign is inverted.
-      // (The psi anchor below would absorb a constant 180° on its own, but
-      // flipping here keeps fusedRoll human-interpretable for the HUD.)
       gravitySign = -1;
       gravX = -gravX;
       gravY = -gravY;
@@ -668,8 +629,6 @@
       gyroScore = 0;
       gyroSign = 0;
     }
-    // The gravity sign is now settled; portrait orientation is handled by
-    // the manual offset button, not auto-detection.
     signCalibrated = true;
   }
 
@@ -717,6 +676,17 @@
         ) * 1.002;
       }
 
+      // --- Camera-buffer orientation swap resync ---------------------------
+      // When the browser rotates the camera buffer (portrait<->landscape),
+      // the content, srcAspect, and screen angle all jump in the same
+      // instant. Snapping the smoothed values to their targets on that frame
+      // collapses what would be a multi-frame wobble into a single frame.
+      if (prevSrcAspect > 0 && Math.abs(srcAspect - prevSrcAspect) > 0.2) {
+        smoothedRoll = computeTargetRoll();
+        smoothedScale = targetScale;
+      }
+      prevSrcAspect = srcAspect;
+
       smoothedScale += (targetScale - smoothedScale) * 0.25;
 
       gl.uniform1f(uRotationLoc, smoothedRoll);
@@ -731,11 +701,84 @@
       const deg = (-smoothedRoll * 180 / Math.PI);
       tiltReadout.textContent = deg.toFixed(1) + '°';
 
-      updateDebug();
+      // --- PREVIEW ROTATION (display only — does NOT touch the recording) ---
+      // The recorded canvas is already correct in every orientation. This
+      // block only rotates how that canvas is DISPLAYED on screen, so when
+      // you physically turn the phone to landscape you SEE a landscape-filling
+      // preview instead of the small letterboxed strip. It reads the phone's
+      // true physical roll (fusedRoll) — the same reliable value the horizon
+      // lock uses — snaps it to the nearest quarter-turn with hysteresis so
+      // it never flickers at the boundary, and applies that as a CSS
+      // transform. Nothing here feeds back into the shader or the recorder.
+      updatePreviewOrientation();
     }
 
     requestAnimationFrame(renderLoop);
   }
+
+  // Snapped physical orientation the preview is currently showing, and a
+  // continuous CSS-rotation accumulator so flips always animate the short way.
+  let previewQuadrant = 0;      // 0 | 90 | 180 | 270  (degrees)
+  let previewCssRotation = 0;   // unbounded degrees fed to CSS rotate()
+  const PREVIEW_HYSTERESIS = 20; // degrees past 45° before the preview flips
+
+  function updatePreviewOrientation() {
+    if (!fusedInit) { sizePreview(0); return; }
+
+    // Use the SCREEN-COMPENSATED roll (the same value driving the shader),
+    // NOT the raw physical roll. Why: if the user's rotation is unlocked, the
+    // browser already rotates the page when they turn to landscape, and
+    // computeTargetRoll() has subtracted that screen angle out. Driving the
+    // preview from this compensated value means:
+    //   • rotation LOCKED  -> screen angle 0 -> this equals physical roll ->
+    //     the preview flips, which is exactly what you want.
+    //   • rotation UNLOCKED -> the browser's own page rotation is already
+    //     showing landscape, the compensated roll stays near 0, and this
+    //     block stays put — no fighting, no double-flip.
+    const shown = smoothedRoll * 180 / Math.PI;
+
+    // Distance from the currently-shown quadrant, wrapped to -180..180.
+    const rel = ((-shown - previewQuadrant) % 360 + 540) % 360 - 180;
+
+    if (Math.abs(rel) > 45 + PREVIEW_HYSTERESIS) {
+      // Nearest quadrant to the angle the content is currently rotated by.
+      const q = ((Math.round(-shown / 90) * 90) % 360 + 360) % 360;
+
+      // Counter-rotate the preview via the shortest arc so the displayed
+      // frame stays upright to the viewer.
+      const targetCss = -q;
+      let delta = ((targetCss - previewCssRotation) % 360 + 540) % 360 - 180;
+      previewCssRotation += delta;
+      previewQuadrant = q;
+      sizePreview(q);
+    }
+  }
+
+  // Size + place the canvas element. When the preview is shown sideways
+  // (quadrant 90/270) the 16:9 frame is scaled so its long edge fills the
+  // screen height — a landscape-filling view even on a portrait screen.
+  function sizePreview(quadrant) {
+    const vw = window.innerWidth;
+    const vh = window.innerHeight;
+
+    // Upright fit: largest 16:9 landscape box that fits the viewport width.
+    const wUp = Math.min(vw, vh * OUT_ASPECT);
+    const hUp = wUp / OUT_ASPECT;
+
+    // Sideways fit: the same frame rotated 90° should fill using the
+    // viewport's height as its width.
+    const wSide = Math.min(vh, vw * OUT_ASPECT);
+    const sideways = (quadrant === 90 || quadrant === 270);
+    const scale = sideways ? (wSide / wUp) : 1;
+
+    canvas.style.width  = wUp + 'px';
+    canvas.style.height = hUp + 'px';
+    canvas.style.transform =
+      'translate(-50%, -50%) rotate(' + previewCssRotation + 'deg) scale(' + scale + ')';
+  }
+
+  window.addEventListener('resize', () => sizePreview(previewQuadrant));
+  sizePreview(0);
 
   // =========================================================================
   // 6. LOCAL RECORDING ENGINE (MediaRecorder -> Web Share -> Files/iCloud)
@@ -863,33 +906,6 @@
     zoomModeBtn.textContent = zoomLocked ? 'LOCKED' : 'AUTO';
     zoomModeBtn.classList.toggle('auto', !zoomLocked);
   });
-
-  // Manual orientation correction. If the automatic guess is wrong in the
-  // current orientation, tap until it's upright — each tap adds 90°, and the
-  // setting is remembered separately for portrait and landscape. Snap the
-  // smoothed roll so the correction is immediate, not animated.
-  const rotateFixBtn = document.getElementById('rotateFixBtn');
-  rotateFixBtn.addEventListener('click', function () {
-    manualOffset = (manualOffset + 90) % 360;
-    smoothedRoll = computeTargetRoll();
-  });
-
-  // Live debug readout — the real device numbers. Tap to hide.
-  const debugPanel = document.getElementById('debugPanel');
-  debugPanel.addEventListener('click', function () {
-    debugPanel.style.display = 'none';
-  });
-  function updateDebug() {
-    const landscape = (video.videoWidth >= video.videoHeight);
-    debugPanel.textContent =
-      'grav  x=' + gravX.toFixed(2) + ' y=' + gravY.toFixed(2) + '\n' +
-      'fused ' + (fusedRoll * 180 / Math.PI).toFixed(1) + '°  ' +
-        'gyro ' + (gyroSign === 0 ? 'cal…' : 'ok') + '\n' +
-      'buffer ' + video.videoWidth + '×' + video.videoHeight +
-        ' (' + (landscape ? 'land' : 'port') + ')\n' +
-      'manual offset ' + manualOffset + '°\n' +
-      'shown ' + (-smoothedRoll * 180 / Math.PI).toFixed(1) + '°';
-  }
 
 })();
 </script>
