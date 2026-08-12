@@ -30,8 +30,9 @@
   /* Hidden <video> element — used purely as a WebGL texture source, never shown directly */
   #srcVideo { position:absolute; width:1px; height:1px; opacity:0; pointer-events:none; }
 
-  /* The visible output — WebGL canvas draws the rotated/zoomed camera feed here */
-  #glCanvas { position:fixed; top:0; left:0; width:100vw; height:100vh; display:block; background:#000; }
+  /* The visible output — a FIXED landscape (16:9) frame, letterboxed on
+     portrait screens exactly like the real Horizon app's portrait view */
+  #glCanvas { position:fixed; top:0; left:0; width:100vw; height:100vh; display:block; background:#000; object-fit:contain; }
 
   /* ---------- PERMISSION / START OVERLAY ---------- */
   #startOverlay {
@@ -175,22 +176,22 @@
   // Start here and adjust to taste on your device.
   const GRAVITY_SMOOTHING = 0.1;
 
-  // --- iOS GRAVITY SIGN FIX (critical) -------------------------------------
-  // iOS reports accelerationIncludingGravity with the OPPOSITE sign from
-  // Android / the DeviceMotion spec. Negating both x and y shifts the
-  // computed roll by 180° (atan2(-x,-y) = atan2(x,y) ± π) — which ROLL_SIGN
-  // cannot correct, since negating atan2's result mirrors the angle instead
-  // (-atan2(x,y) = atan2(-x,y)). Without this, iOS renders upside-down.
-  // The presence of requestPermission() is a reliable iOS 13+ marker.
-  const IS_IOS_MOTION = typeof DeviceMotionEvent !== 'undefined' &&
-                        typeof DeviceMotionEvent.requestPermission === 'function';
-  const GRAVITY_VECTOR_SIGN = IS_IOS_MOTION ? -1 : 1;
+  // --- GRAVITY SIGN AUTO-CALIBRATION (fixes the upside-down recording) -----
+  // Platforms disagree on the sign convention of accelerationIncludingGravity,
+  // and a wrong sign shifts the computed roll by 180° — i.e. an upside-down
+  // image (atan2(-x,-y) = atan2(x,y) ± π). Rather than guessing per-platform
+  // (a previous static iOS guess proved wrong on real hardware), the app
+  // self-calibrates: at startup, the user is necessarily holding the phone
+  // screen-toward-them to tap Start, so the true roll must be near 0. If the
+  // computed roll comes out near 180° instead, the sign is flipped once and
+  // remembered. Works on any device without knowing its convention.
+  let gravitySign = 1;
+  let signCalibrated = false;
 
-  // Flip this to -1 ONLY if, after the iOS fix above, the horizon still
-  // counter-rotates in the wrong direction (i.e. the image visibly tilts
-  // WITH the phone). This corrects mirrored rotation direction; it cannot
-  // and should not be used to fix an upside-down image — that's what
-  // GRAVITY_VECTOR_SIGN above handles.
+  // Flip this to -1 ONLY if the horizon counter-rotates in the wrong
+  // DIRECTION (image tilts with the phone instead of against it). This is a
+  // mirror correction — it cannot fix an upside-down image; the calibration
+  // above handles that.
   const ROLL_SIGN = 1;
 
   // Guards against registering the devicemotion listener more than once if
@@ -202,6 +203,12 @@
   // Smoothed rotation actually sent to the GPU (radians). Smoothing prevents
   // jittery, noisy sensor data from causing a shaky/flickering horizon.
   let smoothedRoll = 0;
+
+  // Smoothed dynamic zoom. The raw cover-zoom is already a continuous
+  // function of the roll angle; this light smoothing additionally hides the
+  // brief jump that occurs if the browser swaps the camera buffer's
+  // orientation (portrait<->landscape) mid-rotation.
+  let smoothedScale = 1;
 
   let combinedStream = null;   // getUserMedia stream (video + mic)
   let audioTrack = null;
@@ -239,53 +246,45 @@
   `;
 
   // --- Fragment shader --------------------------------------------------------
-  // Performs the actual horizon-lock: rotates the sampled UV coordinates by
-  // -uRotation around the frame center, and scales ("zooms") the sample
-  // window by uZoom so that as the frame counter-rotates, its corners never
-  // reveal the transparent/black triangle gaps that a rotated rectangle
-  // would otherwise expose at the screen edges.
+  // The output is a FIXED landscape (16:9) frame locked level to the world —
+  // this is the core of the Horizon behavior ("capture horizontal videos").
+  // For each output pixel: scale by the dynamic cover-zoom (computed on the
+  // CPU so the level rectangle always fits inside the tilted camera frame),
+  // counter-rotate into the camera buffer's orientation, and sample.
+  // Because uScale is exactly the minimal cover zoom, there are never black
+  // corners AND the field of view is the maximum possible at every angle —
+  // ~1x when the phone is level in landscape, zooming in smoothly and
+  // continuously as it rotates toward portrait, exactly like the real app.
   const FRAGMENT_SRC = `
     precision mediump float;
     varying vec2 vTexCoord;
 
     uniform sampler2D uTexture;
-    uniform float uRotation;     // radians, physical roll angle
-    uniform float uZoom;         // e.g. 1.6 -> sample a smaller, zoomed-in window
-    uniform vec2  uResolution;   // canvas pixel size
-    uniform float uVideoAspect;  // video native width / height
+    uniform float uRotation;   // roll of the camera buffer vs world (radians)
+    uniform float uScale;      // dynamic cover zoom (>= exact-fit scale)
+    uniform float uOutAspect;  // output frame aspect (16/9, fixed landscape)
+    uniform float uSrcAspect;  // live camera buffer aspect (w/h)
 
     void main() {
-      // Center coordinates around the middle of the frame (0,0 = center)
-      vec2 uv = vTexCoord - 0.5;
+      // Output-frame physical coords: y spans [-0.5, 0.5], x spans
+      // [-uOutAspect/2, uOutAspect/2] (units of output-frame height).
+      vec2 p = (vTexCoord - 0.5) * vec2(uOutAspect, 1.0);
 
-      // --- Aspect-ratio "cover" correction -----------------------------
-      // Ensures the video fills the whole viewport (like CSS object-fit:
-      // cover) instead of stretching, regardless of phone aspect ratio.
-      float canvasAspect = uResolution.x / uResolution.y;
-      if (canvasAspect > uVideoAspect) {
-        uv.y *= uVideoAspect / canvasAspect;
-      } else {
-        uv.x *= canvasAspect / uVideoAspect;
-      }
+      // Dynamic zoom: shrink the sampled window so the level output rect
+      // always fits inside the rotated camera frame.
+      p /= uScale;
 
-      // --- Digital zoom (shrinks the sampling window == zooms the image) --
-      uv /= uZoom;
-
-      // --- Hardware-accelerated 2D rotation matrix -------------------------
-      // Rotating by -uRotation counter-rotates the incoming camera frame
-      // exactly opposite to the phone's physical roll, so the rendered
-      // output stays visually level regardless of device rotation.
+      // Counter-rotate into the camera buffer's frame.
       float s = sin(-uRotation);
       float c = cos(-uRotation);
       mat2 rot = mat2(c, -s, s, c);
-      uv = rot * uv;
+      vec2 q = rot * p;
 
-      // Recenter
-      uv += 0.5;
+      // Physical source coords -> UV (source height spans [-0.5, 0.5]).
+      vec2 uv = q / vec2(uSrcAspect, 1.0) + 0.5;
 
-      // Anything that rotates outside the source texture bounds is painted
-      // black rather than wrapping/streaking — the 1.6x zoom keeps this
-      // region permanently off-screen under normal rotation.
+      // Guard rail only — uScale keeps sampling inside bounds, so black
+      // should never actually appear.
       if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) {
         gl_FragColor = vec4(0.0, 0.0, 0.0, 1.0);
       } else {
@@ -342,12 +341,24 @@
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
 
-  const uRotationLoc   = gl.getUniformLocation(program, 'uRotation');
-  const uZoomLoc        = gl.getUniformLocation(program, 'uZoom');
-  const uResolutionLoc  = gl.getUniformLocation(program, 'uResolution');
-  const uVideoAspectLoc = gl.getUniformLocation(program, 'uVideoAspect');
+  const uRotationLoc  = gl.getUniformLocation(program, 'uRotation');
+  const uScaleLoc     = gl.getUniformLocation(program, 'uScale');
+  const uOutAspectLoc = gl.getUniformLocation(program, 'uOutAspect');
+  const uSrcAspectLoc = gl.getUniformLocation(program, 'uSrcAspect');
 
-  const ZOOM_FACTOR = 1.6; // absorbs corner cropping across a full rotation sweep
+  // FIXED landscape output frame — the heart of the Horizon behavior.
+  // The canvas is the recording target, so it NEVER resizes: recordings are
+  // always 1920x1080 landscape regardless of how the phone is held, and the
+  // stream dimensions can't change mid-encode (which was corrupting/"morphing"
+  // recordings when the old code resized the canvas with the screen).
+  // Drop to 1280x720 if an older device stutters while recording.
+  const OUT_WIDTH  = 1920;
+  const OUT_HEIGHT = 1080;
+  const OUT_ASPECT = OUT_WIDTH / OUT_HEIGHT;
+  canvas.width  = OUT_WIDTH;
+  canvas.height = OUT_HEIGHT;
+  gl.viewport(0, 0, OUT_WIDTH, OUT_HEIGHT);
+  gl.uniform1f(uOutAspectLoc, OUT_ASPECT);
 
   // =========================================================================
   // 3. INVERSION-SHIELD SENSOR MATH
@@ -416,10 +427,10 @@
     const g = evt.accelerationIncludingGravity;
     if (!g || g.x === null || g.y === null) return;
 
-    // Apply the platform sign correction at the source so all downstream
-    // math works in one consistent (spec/Android) convention.
-    const gx = g.x * GRAVITY_VECTOR_SIGN;
-    const gy = g.y * GRAVITY_VECTOR_SIGN;
+    // Apply the (auto-calibrated) platform sign correction at the source so
+    // all downstream math works in one consistent convention.
+    const gx = g.x * gravitySign;
+    const gy = g.y * gravitySign;
 
     // Seed the filter with the first real reading so it doesn't have to ramp
     // up from zero (which would cause a visible swing on startup).
@@ -494,60 +505,78 @@
   });
 
   // =========================================================================
-  // 5. RENDER LOOP (WebGL @ up to 60fps)
+  // 5. RENDER LOOP (WebGL, fixed 1920x1080 landscape frame)
   // =========================================================================
-  function resizeCanvasToDisplaySize() {
-    // NEVER resize while recording: changing the canvas dimensions changes
-    // the captured stream's resolution mid-encode, which glitches or
-    // corrupts MediaRecorder output on several platforms. The canvas simply
-    // stays at its pre-recording size until the recording stops (the CSS
-    // stretch may look slightly off if the user rotates mid-recording, but
-    // the recorded file stays intact — the right tradeoff).
-    if (isRecording) return;
+  // The canvas never resizes (see OUT_WIDTH above), so there is no resize
+  // handler — CSS object-fit:contain letterboxes the fixed landscape frame
+  // on portrait screens, matching the real app's portrait view.
 
-    const dpr = Math.min(window.devicePixelRatio || 1, 2); // cap for perf
-    const w = Math.round(window.innerWidth * dpr);
-    const h = Math.round(window.innerHeight * dpr);
-    if (canvas.width !== w || canvas.height !== h) {
-      canvas.width = w;
-      canvas.height = h;
-      gl.viewport(0, 0, w, h);
+  // One-time gravity sign calibration (see the explanation at gravitySign).
+  // Runs on the first frame with a strong-enough in-plane gravity reading;
+  // requires the phone to be held roughly screen-toward-user, which is
+  // guaranteed in practice because the user just tapped the Start button.
+  function calibrateGravitySign() {
+    if (signCalibrated || !gravInit) return;
+    // Skip if the phone is lying nearly flat (in-plane gravity too weak to
+    // judge orientation reliably); try again next frame.
+    if (Math.hypot(gravX, gravY) < 4.0) return;
+    const roll = computeTargetRoll();
+    if (Math.cos(roll) < 0) {
+      // Computed roll is closer to 180° than 0° while the user is holding
+      // the phone normally -> this platform's gravity sign is inverted.
+      gravitySign = -1;
+      gravX = -gravX;
+      gravY = -gravY;
     }
+    signCalibrated = true;
   }
 
   function renderLoop() {
-    resizeCanvasToDisplaySize();
-
     if (video.readyState >= video.HAVE_CURRENT_DATA && video.videoWidth > 0) {
+      calibrateGravitySign();
+
       // Upload the current video frame straight into the GPU texture.
       gl.bindTexture(gl.TEXTURE_2D, texture);
       gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, video);
 
       // Recompute the horizon-lock rotation every frame. The heavy smoothing
-      // now happens on the gravity input (GRAVITY_SMOOTHING); this final lerp
+      // happens on the gravity input (GRAVITY_SMOOTHING); this final lerp
       // is light, just to smooth the RAF/sensor timing mismatch.
       const target = computeTargetRoll();
       smoothedRoll = lerpAngle(smoothedRoll, target, 0.5);
 
+      // --- Dynamic cover-zoom -------------------------------------------
+      // Minimal zoom such that the level landscape output rect (OUT_ASPECT x 1)
+      // rotated by smoothedRoll fits entirely inside the camera buffer
+      // (srcAspect x 1). Continuous in the angle -> the zoom breathes
+      // smoothly as the phone rotates: ~1x level in landscape, zooming in
+      // toward portrait. The tiny 1.002 margin avoids edge-pixel bleed.
+      const srcAspect = video.videoWidth / video.videoHeight;
+      const ac = Math.abs(Math.cos(smoothedRoll));
+      const as = Math.abs(Math.sin(smoothedRoll));
+      const coverScale = Math.max(
+        (OUT_ASPECT * ac + as) / srcAspect,
+        (OUT_ASPECT * as + ac)
+      ) * 1.002;
+      // Light extra smoothing hides the one-frame jump if the browser swaps
+      // the camera buffer orientation (portrait<->landscape) mid-rotation.
+      smoothedScale += (coverScale - smoothedScale) * 0.25;
+
       gl.uniform1f(uRotationLoc, smoothedRoll);
-      gl.uniform1f(uZoomLoc, ZOOM_FACTOR);
-      gl.uniform2f(uResolutionLoc, canvas.width, canvas.height);
-      gl.uniform1f(uVideoAspectLoc, video.videoWidth / video.videoHeight);
+      gl.uniform1f(uScaleLoc, smoothedScale);
+      gl.uniform1f(uSrcAspectLoc, srcAspect);
 
       gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
 
       // HUD readout (degrees, 0.0 = perfectly level). If tilting the phone
-      // clockwise makes this number move the wrong way, or the video visibly
-      // rotates WITH the phone instead of counter-rotating to stay level,
-      // flip the ROLL_SIGN constant above and reload.
+      // clockwise makes the image visibly rotate WITH the phone instead of
+      // counter-rotating to stay level, flip ROLL_SIGN above and reload.
       const deg = (-smoothedRoll * 180 / Math.PI);
       tiltReadout.textContent = deg.toFixed(1) + '°';
     }
 
     requestAnimationFrame(renderLoop);
   }
-
-  window.addEventListener('resize', resizeCanvasToDisplaySize);
 
   // =========================================================================
   // 6. LOCAL RECORDING ENGINE (MediaRecorder -> Web Share -> Files/iCloud)
