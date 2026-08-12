@@ -715,97 +715,34 @@
     requestAnimationFrame(renderLoop);
   }
 
-  // Snapped physical orientation the preview is currently showing, and a
-  // continuous CSS-rotation accumulator so flips always animate the short way.
-  let previewQuadrant = 0;      // 0 | 90 | 180 | 270  (degrees)
-  let previewCssRotation = 0;   // unbounded degrees fed to CSS rotate()
-  let previewScale = 1;         // current base scale at rest
-  const PREVIEW_HYSTERESIS = 20; // degrees past 45° before the preview flips
-
-  function transformStr(rotDeg, scale) {
-    return 'translate(-50%, -50%) rotate(' + rotDeg + 'deg) scale(' + scale + ')';
-  }
-
-  // Scale so the frame, rotated to `rotDeg`, COVERS the viewport with no black
-  // corners. Peaks around the diagonal — this is the zoom that masks the flip.
-  function coverScaleAt(rotDeg, wUp, hUp) {
-    const a = rotDeg * Math.PI / 180;
-    const ca = Math.abs(Math.cos(a));
-    const sa = Math.abs(Math.sin(a));
-    const vw = window.innerWidth;
-    const vh = window.innerHeight;
-    const bx = (vw / 2) * ca + (vh / 2) * sa;
-    const by = (vw / 2) * sa + (vh / 2) * ca;
-    return Math.max((2 * bx) / wUp, (2 * by) / hUp);
-  }
-
+  // Continuous zoom preview: the canvas scales in and out LIVE as a direct
+  // function of the tilt angle, every frame — the original "breathing" effect.
+  // No quadrant snapping, no flip animation. The scale is exactly the cover
+  // amount for the current roll, so as you tilt, the frame zooms in through
+  // the diagonal and back out — tracking every degree.
   function updatePreviewOrientation() {
-    if (!fusedInit) { sizePreview(0); return; }
-
-    // Screen-compensated roll (same value the shader uses): 0 when the OS has
-    // already handled the rotation, = physical roll when it hasn't.
-    const shown = smoothedRoll * 180 / Math.PI;
-    const rel = ((-shown - previewQuadrant) % 360 + 540) % 360 - 180;
-
-    if (Math.abs(rel) > 45 + PREVIEW_HYSTERESIS) {
-      const q = ((Math.round(-shown / 90) * 90) % 360 + 360) % 360;
-      const targetCss = -q;
-      let delta = ((targetCss - previewCssRotation) % 360 + 540) % 360 - 180;
-
-      const fromRot = previewCssRotation;
-      const fromScale = previewScale;
-      const toRot = previewCssRotation + delta;
-      previewCssRotation = toRot;
-      previewQuadrant = q;
-
-      const dims = previewDims();
-      const toScale = (q === 90 || q === 270) ? dims.sideways : 1;
-      previewScale = toScale;
-
-      // Build keyframes across the 90° turn, each with the exact cover scale
-      // for that intermediate angle. The frame therefore zooms IN as it turns
-      // through the diagonal (hiding every black corner) and back OUT into the
-      // next orientation — the flip is masked by the zoom, never a bare snap.
-      const steps = 6;
-      const frames = [];
-      for (let i = 0; i <= steps; i++) {
-        const t = i / steps;
-        const rot = fromRot + delta * t;
-        const restScale = fromScale + (toScale - fromScale) * t;
-        // At the endpoints use the clean rest scale; in between, whichever is
-        // larger of the interpolated rest scale and the no-black cover scale.
-        const cover = coverScaleAt(rot, dims.wUp, dims.hUp);
-        const s = (i === 0 || i === steps) ? restScale : Math.max(restScale, cover);
-        frames.push({ transform: transformStr(rot, s) });
-      }
-
-      canvas.animate(frames, { duration: 460, easing: 'ease-in-out', fill: 'none' });
-      // Lock in the final rest transform so it holds after the animation.
-      canvas.style.transform = transformStr(toRot, toScale);
-    }
-  }
-
-  function previewDims() {
     const vw = window.innerWidth;
     const vh = window.innerHeight;
     const wUp = Math.min(vw, vh * OUT_ASPECT);
     const hUp = wUp / OUT_ASPECT;
-    const wSide = Math.min(vh, vw * OUT_ASPECT);
-    return { wUp: wUp, hUp: hUp, sideways: wSide / wUp };
+
+    // Roll the preview by the live smoothed angle (radians -> deg) and zoom to
+    // cover so no black corners ever show. Both update every frame.
+    const rotDeg = -smoothedRoll * 180 / Math.PI;
+    const a = smoothedRoll;
+    const ca = Math.abs(Math.cos(a));
+    const sa = Math.abs(Math.sin(a));
+    const bx = (vw / 2) * ca + (vh / 2) * sa;
+    const by = (vw / 2) * sa + (vh / 2) * ca;
+    const scale = Math.max((2 * bx) / wUp, (2 * by) / hUp);
+
+    canvas.style.width  = wUp + 'px';
+    canvas.style.height = hUp + 'px';
+    canvas.style.transform =
+      'translate(-50%, -50%) rotate(' + rotDeg + 'deg) scale(' + scale + ')';
   }
 
-  // Size + place the canvas element at a rest orientation (no animation).
-  function sizePreview(quadrant) {
-    const dims = previewDims();
-    const sideways = (quadrant === 90 || quadrant === 270);
-    previewScale = sideways ? dims.sideways : 1;
-    canvas.style.width  = dims.wUp + 'px';
-    canvas.style.height = dims.hUp + 'px';
-    canvas.style.transform = transformStr(previewCssRotation, previewScale);
-  }
-
-  window.addEventListener('resize', () => sizePreview(previewQuadrant));
-  sizePreview(0);
+  updatePreviewOrientation();
 
   // =========================================================================
   // 6. LOCAL RECORDING ENGINE (MediaRecorder -> Web Share -> Files/iCloud)
