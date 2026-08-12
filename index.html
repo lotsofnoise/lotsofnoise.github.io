@@ -36,7 +36,6 @@
     position:fixed; top:50%; left:50%;
     display:block; background:#000;
     transform-origin:center center;
-    transition: transform 0.4s cubic-bezier(0.22, 1, 0.36, 1);
   }
 
   /* ---------- PERMISSION / START OVERLAY ---------- */
@@ -119,7 +118,7 @@
     <div id="tiltReadout">0.0°</div>
     <div id="recStatus"><span id="recDot"></span>REC <span id="recTime">00:00</span></div>
     <div id="bottomBar">
-      <button id="zoomModeBtn" aria-label="Zoom mode">LOCKED</button>
+      <button id="zoomModeBtn" aria-label="Zoom mode">AUTO</button>
       <button id="recordBtn" aria-label="Record"></button>
       <div id="bottomSpacer"></div>
     </div>
@@ -222,7 +221,7 @@
   //             permanently tighter crop.
   // 'dynamic' = zoom breathes with the angle for maximum field of view at
   //             every tilt (what the previous version did).
-  let zoomLocked = true;
+  let zoomLocked = false;
   let lockedZoomAspect = 0;   // srcAspect the cached locked value was computed for
   let lockedZoomValue = 1;
   let prevSrcAspect = 0;      // for detecting camera-buffer orientation swaps
@@ -720,61 +719,89 @@
   // continuous CSS-rotation accumulator so flips always animate the short way.
   let previewQuadrant = 0;      // 0 | 90 | 180 | 270  (degrees)
   let previewCssRotation = 0;   // unbounded degrees fed to CSS rotate()
+  let previewScale = 1;         // current base scale at rest
   const PREVIEW_HYSTERESIS = 20; // degrees past 45° before the preview flips
+
+  function transformStr(rotDeg, scale) {
+    return 'translate(-50%, -50%) rotate(' + rotDeg + 'deg) scale(' + scale + ')';
+  }
+
+  // Scale so the frame, rotated to `rotDeg`, COVERS the viewport with no black
+  // corners. Peaks around the diagonal — this is the zoom that masks the flip.
+  function coverScaleAt(rotDeg, wUp, hUp) {
+    const a = rotDeg * Math.PI / 180;
+    const ca = Math.abs(Math.cos(a));
+    const sa = Math.abs(Math.sin(a));
+    const vw = window.innerWidth;
+    const vh = window.innerHeight;
+    const bx = (vw / 2) * ca + (vh / 2) * sa;
+    const by = (vw / 2) * sa + (vh / 2) * ca;
+    return Math.max((2 * bx) / wUp, (2 * by) / hUp);
+  }
 
   function updatePreviewOrientation() {
     if (!fusedInit) { sizePreview(0); return; }
 
-    // Use the SCREEN-COMPENSATED roll (the same value driving the shader),
-    // NOT the raw physical roll. Why: if the user's rotation is unlocked, the
-    // browser already rotates the page when they turn to landscape, and
-    // computeTargetRoll() has subtracted that screen angle out. Driving the
-    // preview from this compensated value means:
-    //   • rotation LOCKED  -> screen angle 0 -> this equals physical roll ->
-    //     the preview flips, which is exactly what you want.
-    //   • rotation UNLOCKED -> the browser's own page rotation is already
-    //     showing landscape, the compensated roll stays near 0, and this
-    //     block stays put — no fighting, no double-flip.
+    // Screen-compensated roll (same value the shader uses): 0 when the OS has
+    // already handled the rotation, = physical roll when it hasn't.
     const shown = smoothedRoll * 180 / Math.PI;
-
-    // Distance from the currently-shown quadrant, wrapped to -180..180.
     const rel = ((-shown - previewQuadrant) % 360 + 540) % 360 - 180;
 
     if (Math.abs(rel) > 45 + PREVIEW_HYSTERESIS) {
-      // Nearest quadrant to the angle the content is currently rotated by.
       const q = ((Math.round(-shown / 90) * 90) % 360 + 360) % 360;
-
-      // Counter-rotate the preview via the shortest arc so the displayed
-      // frame stays upright to the viewer.
       const targetCss = -q;
       let delta = ((targetCss - previewCssRotation) % 360 + 540) % 360 - 180;
-      previewCssRotation += delta;
+
+      const fromRot = previewCssRotation;
+      const fromScale = previewScale;
+      const toRot = previewCssRotation + delta;
+      previewCssRotation = toRot;
       previewQuadrant = q;
-      sizePreview(q);
+
+      const dims = previewDims();
+      const toScale = (q === 90 || q === 270) ? dims.sideways : 1;
+      previewScale = toScale;
+
+      // Build keyframes across the 90° turn, each with the exact cover scale
+      // for that intermediate angle. The frame therefore zooms IN as it turns
+      // through the diagonal (hiding every black corner) and back OUT into the
+      // next orientation — the flip is masked by the zoom, never a bare snap.
+      const steps = 6;
+      const frames = [];
+      for (let i = 0; i <= steps; i++) {
+        const t = i / steps;
+        const rot = fromRot + delta * t;
+        const restScale = fromScale + (toScale - fromScale) * t;
+        // At the endpoints use the clean rest scale; in between, whichever is
+        // larger of the interpolated rest scale and the no-black cover scale.
+        const cover = coverScaleAt(rot, dims.wUp, dims.hUp);
+        const s = (i === 0 || i === steps) ? restScale : Math.max(restScale, cover);
+        frames.push({ transform: transformStr(rot, s) });
+      }
+
+      canvas.animate(frames, { duration: 460, easing: 'ease-in-out', fill: 'none' });
+      // Lock in the final rest transform so it holds after the animation.
+      canvas.style.transform = transformStr(toRot, toScale);
     }
   }
 
-  // Size + place the canvas element. When the preview is shown sideways
-  // (quadrant 90/270) the 16:9 frame is scaled so its long edge fills the
-  // screen height — a landscape-filling view even on a portrait screen.
-  function sizePreview(quadrant) {
+  function previewDims() {
     const vw = window.innerWidth;
     const vh = window.innerHeight;
-
-    // Upright fit: largest 16:9 landscape box that fits the viewport width.
     const wUp = Math.min(vw, vh * OUT_ASPECT);
     const hUp = wUp / OUT_ASPECT;
-
-    // Sideways fit: the same frame rotated 90° should fill using the
-    // viewport's height as its width.
     const wSide = Math.min(vh, vw * OUT_ASPECT);
-    const sideways = (quadrant === 90 || quadrant === 270);
-    const scale = sideways ? (wSide / wUp) : 1;
+    return { wUp: wUp, hUp: hUp, sideways: wSide / wUp };
+  }
 
-    canvas.style.width  = wUp + 'px';
-    canvas.style.height = hUp + 'px';
-    canvas.style.transform =
-      'translate(-50%, -50%) rotate(' + previewCssRotation + 'deg) scale(' + scale + ')';
+  // Size + place the canvas element at a rest orientation (no animation).
+  function sizePreview(quadrant) {
+    const dims = previewDims();
+    const sideways = (quadrant === 90 || quadrant === 270);
+    previewScale = sideways ? dims.sideways : 1;
+    canvas.style.width  = dims.wUp + 'px';
+    canvas.style.height = dims.hUp + 'px';
+    canvas.style.transform = transformStr(previewCssRotation, previewScale);
   }
 
   window.addEventListener('resize', () => sizePreview(previewQuadrant));
@@ -901,6 +928,7 @@
   // gimbal-like, default) <-> AUTO (dynamic zoom, maximum field of view,
   // visible breathing as the angle changes).
   const zoomModeBtn = document.getElementById('zoomModeBtn');
+  zoomModeBtn.classList.toggle('auto', !zoomLocked); // reflect default on load
   zoomModeBtn.addEventListener('click', function () {
     zoomLocked = !zoomLocked;
     zoomModeBtn.textContent = zoomLocked ? 'LOCKED' : 'AUTO';
