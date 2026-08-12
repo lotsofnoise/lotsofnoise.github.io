@@ -448,21 +448,10 @@
   }
 
   function computeTargetRoll() {
-    // Hold steady until the sensors have been seeded.
-    if (!gravInit || !fusedInit) return smoothedRoll;
-
-    // Level purely to gravity. fusedRoll is derived from the gravity vector
-    // via atan2, so it moves smoothly and continuously from 0° (portrait) to
-    // ~90° (landscape) — the shader's -fusedRoll counter-rotation therefore
-    // stays level the whole way with NO sudden flip.
-    //
-    // The previous version subtracted getScreenAngleDeg(). That value is the
-    // ONE thing in this pipeline that jumps 180° the instant the phone goes
-    // sideways on a home-screen web app (the browser reports it wrong there),
-    // which is exactly the "upright in portrait, upside-down the moment I turn
-    // sideways" symptom. Removing it fixes landscape and leaves portrait
-    // unchanged (screen angle was 0 there anyway).
-    return fusedRoll;
+    // Returning 0 completely disables the counter-rotation (tilt) 
+    // for the WebGL canvas, which is the source of the recording.
+    // The output video will be completely stable to the camera's raw feed.
+    return 0;
   }
 
   // Shortest-path angle interpolation. A naive lerp between e.g. +179° and
