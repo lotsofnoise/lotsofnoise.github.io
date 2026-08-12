@@ -1,0 +1,592 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+<title>Horizon Level Camera</title>
+
+<!-- ---------- PWA / Home Screen install support ---------- -->
+<link rel="manifest" href="manifest.json">
+<meta name="theme-color" content="#000000">
+
+<!-- iOS "Add to Home Screen" support (Safari ignores manifest.json for these) -->
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Horizon">
+<link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
+
+<!-- Android / Chrome install icon -->
+<link rel="icon" type="image/png" sizes="192x192" href="icons/icon-192.png">
+
+<style>
+  /* ---------- BASE RESET ---------- */
+  * { margin:0; padding:0; box-sizing:border-box; -webkit-user-select:none; user-select:none; -webkit-tap-highlight-color:transparent; }
+  html, body {
+    width:100%; height:100%; overflow:hidden;
+    background:#000; font-family:-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    touch-action:none;
+  }
+
+  /* Hidden <video> element — used purely as a WebGL texture source, never shown directly */
+  #srcVideo { position:absolute; width:1px; height:1px; opacity:0; pointer-events:none; }
+
+  /* The visible output — WebGL canvas draws the rotated/zoomed camera feed here */
+  #glCanvas { position:fixed; top:0; left:0; width:100vw; height:100vh; display:block; background:#000; }
+
+  /* ---------- PERMISSION / START OVERLAY ---------- */
+  #startOverlay {
+    position:fixed; inset:0; z-index:50;
+    background:rgba(0,0,0,0.92);
+    display:flex; flex-direction:column; align-items:center; justify-content:center;
+    color:#fff; text-align:center; padding:24px;
+  }
+  #startOverlay h1 { font-size:22px; font-weight:600; margin-bottom:10px; }
+  #startOverlay p { font-size:14px; opacity:0.7; margin-bottom:28px; max-width:320px; line-height:1.4; }
+  #startBtn {
+    background:#ffcc00; color:#000; border:none; border-radius:50px;
+    padding:16px 42px; font-size:16px; font-weight:700; letter-spacing:0.5px;
+    box-shadow:0 4px 20px rgba(255,204,0,0.4);
+  }
+  #startBtn:active { transform:scale(0.96); }
+  #errorMsg { color:#ff5c5c; font-size:13px; margin-top:18px; max-width:300px; }
+  #installHint {
+    color:#888; font-size:12px; margin-top:22px; max-width:280px; line-height:1.4;
+    border-top:1px solid rgba(255,255,255,0.1); padding-top:16px; display:none;
+  }
+  #installHint.show { display:block; }
+
+  /* ---------- ON-SCREEN HUD ---------- */
+  #hud {
+    position:fixed; inset:0; z-index:10; pointer-events:none;
+    display:flex; flex-direction:column; justify-content:space-between;
+  }
+  #tiltReadout {
+    align-self:center; margin-top:env(safe-area-inset-top, 20px);
+    background:rgba(0,0,0,0.4); color:#ffcc00;
+    font-variant-numeric:tabular-nums; font-size:14px; font-weight:600;
+    padding:6px 16px; border-radius:20px; letter-spacing:1px;
+  }
+  #bottomBar {
+    display:flex; align-items:center; justify-content:center;
+    padding-bottom:calc(env(safe-area-inset-bottom, 20px) + 20px);
+    pointer-events:auto; gap:24px;
+  }
+  #recordBtn {
+    width:76px; height:76px; border-radius:50%;
+    border:4px solid rgba(255,255,255,0.85);
+    background:transparent; position:relative;
+  }
+  #recordBtn::after {
+    content:''; position:absolute; inset:6px; border-radius:50%;
+    background:#ff3b30; transition:border-radius 0.2s, inset 0.2s;
+  }
+  #recordBtn.recording::after { border-radius:6px; inset:20px; }
+  #recordBtn.recording { border-color:#ff3b30; }
+  #recStatus {
+    position:absolute; top:calc(env(safe-area-inset-top, 20px) + 44px);
+    left:50%; transform:translateX(-50%);
+    color:#ff5c5c; font-size:13px; font-weight:600; display:none; align-items:center; gap:6px;
+  }
+  #recStatus.show { display:flex; }
+  #recDot { width:8px; height:8px; border-radius:50%; background:#ff3b30; animation:pulse 1s infinite; }
+  @keyframes pulse { 0%,100%{opacity:1;} 50%{opacity:0.2;} }
+</style>
+</head>
+<body>
+
+  <!-- Camera feed source (invisible, feeds pixels into the WebGL texture) -->
+  <video id="srcVideo" playsinline muted autoplay></video>
+
+  <!-- WebGL render target: this is what the user actually sees -->
+  <canvas id="glCanvas"></canvas>
+
+  <!-- HUD overlay -->
+  <div id="hud">
+    <div id="tiltReadout">0.0°</div>
+    <div id="recStatus"><span id="recDot"></span>REC <span id="recTime">00:00</span></div>
+    <div id="bottomBar">
+      <button id="recordBtn" aria-label="Record"></button>
+    </div>
+  </div>
+
+  <!-- Start / permission-handshake overlay (required for iOS Safari motion sensors) -->
+  <div id="startOverlay">
+    <h1>Horizon Level Camera</h1>
+    <p>Locks the video to true horizontal, no matter how the phone is rotated. Tap below to grant camera, microphone, and motion sensor access.</p>
+    <button id="startBtn">Start Camera</button>
+    <div id="errorMsg"></div>
+    <div id="installHint">Tip: use your browser's "Add to Home Screen" (Safari: Share → Add to Home Screen) to install this like an app and launch it full-screen.</div>
+  </div>
+
+<script>
+(function () {
+  'use strict';
+
+  // =========================================================================
+  // 0. PWA: SERVICE WORKER REGISTRATION
+  // =========================================================================
+  // Registers the offline cache. Runs relative to wherever this file is
+  // hosted, so it works whether deployed at a domain root or a subpath.
+  if ('serviceWorker' in navigator) {
+    window.addEventListener('load', () => {
+      navigator.serviceWorker.register('service-worker.js').catch((err) => {
+        console.warn('Service worker registration failed:', err);
+      });
+    });
+  }
+
+  // Show the "Add to Home Screen" hint only when not already running in
+  // standalone/installed mode (no point nagging someone already using it as an app).
+  const isStandalone = window.matchMedia('(display-mode: standalone)').matches
+                     || window.navigator.standalone === true;
+  if (!isStandalone) {
+    document.getElementById('installHint').classList.add('show');
+  }
+
+  // =========================================================================
+  // 1. GLOBAL STATE
+  // =========================================================================
+  const video   = document.getElementById('srcVideo');
+  const canvas  = document.getElementById('glCanvas');
+  const overlay = document.getElementById('startOverlay');
+  const startBtn = document.getElementById('startBtn');
+  const errorMsg = document.getElementById('errorMsg');
+  const recordBtn = document.getElementById('recordBtn');
+  const recStatus = document.getElementById('recStatus');
+  const recTimeEl = document.getElementById('recTime');
+  const tiltReadout = document.getElementById('tiltReadout');
+
+  const DEG2RAD = Math.PI / 180;
+
+  // Raw sensor readings, updated by the deviceorientation listener.
+  let rawBeta = 0;   // front-back tilt, -180..180
+  let rawGamma = 0;  // left-right tilt, -90..90
+
+  // Smoothed rotation actually sent to the GPU (radians). Smoothing prevents
+  // jittery, noisy sensor data from causing a shaky/flickering horizon.
+  let smoothedRoll = 0;
+
+  let combinedStream = null;   // getUserMedia stream (video + mic)
+  let audioTrack = null;
+  let mediaRecorder = null;
+  let recordedChunks = [];
+  let isRecording = false;
+  let recStartTime = 0;
+  let recTimerHandle = null;
+
+  // =========================================================================
+  // 2. WEBGL SETUP
+  // =========================================================================
+  const gl = canvas.getContext('webgl', { antialias: false, preserveDrawingBuffer: false })
+          || canvas.getContext('experimental-webgl');
+
+  if (!gl) {
+    fatalError('WebGL is not available on this device/browser.');
+    return;
+  }
+
+  // --- Vertex shader --------------------------------------------------------
+  // Purely a pass-through: draws one full-screen quad (as a triangle strip)
+  // and forwards normalized texture coordinates to the fragment shader.
+  // Screen-orientation layout correctness is handled by the canvas resize
+  // logic (matching the drawing buffer to devicePixelRatio * viewport), so
+  // the vertex stage itself stays a simple, cheap, GPU-friendly pass-through.
+  const VERTEX_SRC = `
+    attribute vec2 aPosition;   // clip-space quad corners (-1..1)
+    attribute vec2 aTexCoord;   // matching UV corners (0..1)
+    varying vec2 vTexCoord;
+    void main() {
+      vTexCoord = aTexCoord;
+      gl_Position = vec4(aPosition, 0.0, 1.0);
+    }
+  `;
+
+  // --- Fragment shader --------------------------------------------------------
+  // Performs the actual horizon-lock: rotates the sampled UV coordinates by
+  // -uRotation around the frame center, and scales ("zooms") the sample
+  // window by uZoom so that as the frame counter-rotates, its corners never
+  // reveal the transparent/black triangle gaps that a rotated rectangle
+  // would otherwise expose at the screen edges.
+  const FRAGMENT_SRC = `
+    precision mediump float;
+    varying vec2 vTexCoord;
+
+    uniform sampler2D uTexture;
+    uniform float uRotation;     // radians, physical roll angle
+    uniform float uZoom;         // e.g. 1.6 -> sample a smaller, zoomed-in window
+    uniform vec2  uResolution;   // canvas pixel size
+    uniform float uVideoAspect;  // video native width / height
+
+    void main() {
+      // Center coordinates around the middle of the frame (0,0 = center)
+      vec2 uv = vTexCoord - 0.5;
+
+      // --- Aspect-ratio "cover" correction -----------------------------
+      // Ensures the video fills the whole viewport (like CSS object-fit:
+      // cover) instead of stretching, regardless of phone aspect ratio.
+      float canvasAspect = uResolution.x / uResolution.y;
+      if (canvasAspect > uVideoAspect) {
+        uv.y *= uVideoAspect / canvasAspect;
+      } else {
+        uv.x *= canvasAspect / uVideoAspect;
+      }
+
+      // --- Digital zoom (shrinks the sampling window == zooms the image) --
+      uv /= uZoom;
+
+      // --- Hardware-accelerated 2D rotation matrix -------------------------
+      // Rotating by -uRotation counter-rotates the incoming camera frame
+      // exactly opposite to the phone's physical roll, so the rendered
+      // output stays visually level regardless of device rotation.
+      float s = sin(-uRotation);
+      float c = cos(-uRotation);
+      mat2 rot = mat2(c, -s, s, c);
+      uv = rot * uv;
+
+      // Recenter
+      uv += 0.5;
+
+      // Anything that rotates outside the source texture bounds is painted
+      // black rather than wrapping/streaking — the 1.6x zoom keeps this
+      // region permanently off-screen under normal rotation.
+      if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) {
+        gl_FragColor = vec4(0.0, 0.0, 0.0, 1.0);
+      } else {
+        gl_FragColor = texture2D(uTexture, uv);
+      }
+    }
+  `;
+
+  function compileShader(type, src) {
+    const shader = gl.createShader(type);
+    gl.shaderSource(shader, src);
+    gl.compileShader(shader);
+    if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+      const info = gl.getShaderInfoLog(shader);
+      gl.deleteShader(shader);
+      throw new Error('Shader compile error: ' + info);
+    }
+    return shader;
+  }
+
+  const program = gl.createProgram();
+  gl.attachShader(program, compileShader(gl.VERTEX_SHADER, VERTEX_SRC));
+  gl.attachShader(program, compileShader(gl.FRAGMENT_SHADER, FRAGMENT_SRC));
+  gl.linkProgram(program);
+  if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+    fatalError('WebGL program link error: ' + gl.getProgramInfoLog(program));
+    return;
+  }
+  gl.useProgram(program);
+
+  // Full-screen quad (two triangles via TRIANGLE_STRIP)
+  const positions = new Float32Array([ -1,-1,  1,-1,  -1,1,  1,1 ]);
+  const texCoords  = new Float32Array([  0,1,   1,1,    0,0,  1,0 ]);
+
+  const posBuffer = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, posBuffer);
+  gl.bufferData(gl.ARRAY_BUFFER, positions, gl.STATIC_DRAW);
+  const aPosition = gl.getAttribLocation(program, 'aPosition');
+  gl.enableVertexAttribArray(aPosition);
+  gl.vertexAttribPointer(aPosition, 2, gl.FLOAT, false, 0, 0);
+
+  const texBuffer = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, texBuffer);
+  gl.bufferData(gl.ARRAY_BUFFER, texCoords, gl.STATIC_DRAW);
+  const aTexCoord = gl.getAttribLocation(program, 'aTexCoord');
+  gl.enableVertexAttribArray(aTexCoord);
+  gl.vertexAttribPointer(aTexCoord, 2, gl.FLOAT, false, 0, 0);
+
+  // Texture that the live video frame gets uploaded into every RAF tick
+  const texture = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, texture);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+
+  const uRotationLoc   = gl.getUniformLocation(program, 'uRotation');
+  const uZoomLoc        = gl.getUniformLocation(program, 'uZoom');
+  const uResolutionLoc  = gl.getUniformLocation(program, 'uResolution');
+  const uVideoAspectLoc = gl.getUniformLocation(program, 'uVideoAspect');
+
+  const ZOOM_FACTOR = 1.6; // absorbs corner cropping across a full rotation sweep
+
+  // =========================================================================
+  // 3. INVERSION-SHIELD SENSOR MATH
+  // =========================================================================
+  //
+  // The key insight: the direction of gravity relative to the DEVICE only
+  // depends on beta (front-back tilt) and gamma (left-right tilt) — it does
+  // NOT depend on alpha (compass heading), because alpha is a rotation about
+  // the same axis gravity points along. That means we can compute a gravity
+  // vector in device-space directly from beta/gamma, then take atan2() of
+  // its components to get a roll angle.
+  //
+  // Using atan2() instead of manual angle arithmetic is what makes this
+  // "flip-proof": atan2 sweeps smoothly and continuously through all 360
+  // degrees as the phone is rotated like a steering wheel, with no branch
+  // jumps, no snapping to quadrants, and no sudden inversion — unlike naive
+  // formulas that break down whenever beta crosses ±90 or ±180.
+  function getScreenAngleDeg() {
+    // Prefer the modern Screen Orientation API (Android Chrome, etc.)
+    if (screen.orientation && typeof screen.orientation.angle === 'number') {
+      return screen.orientation.angle;
+    }
+    // iOS Safari fallback (window.orientation is deprecated but still live there)
+    if (typeof window.orientation === 'number') {
+      return window.orientation;
+    }
+    return 0;
+  }
+
+  function computeTargetRoll() {
+    const betaRad  = rawBeta * DEG2RAD;
+    const gammaRad = rawGamma * DEG2RAD;
+
+    // Gravity vector components in device-local coordinates (alpha-independent).
+    const gx = Math.sin(gammaRad);
+    const gy = -Math.sin(betaRad) * Math.cos(gammaRad);
+
+    // atan2 gives a continuous angle in (-PI, PI] with no discontinuity as
+    // gravity sweeps a full circle around the device — this is what
+    // prevents the horizon from ever snapping or flipping.
+    let roll = Math.atan2(gx, -gy);
+
+    // Compensate for the physical screen rotation (portrait vs landscape,
+    // and landscape-left vs landscape-right) so the correction is always
+    // relative to how the user is actually holding/viewing the screen.
+    roll -= getScreenAngleDeg() * DEG2RAD;
+
+    return roll;
+  }
+
+  // Shortest-path angle interpolation. A naive lerp between e.g. +179° and
+  // -179° would spin the long way around; this always takes the short way,
+  // which is essential near the ±180° wrap boundary.
+  function lerpAngle(a, b, t) {
+    let diff = b - a;
+    while (diff > Math.PI)  diff -= Math.PI * 2;
+    while (diff < -Math.PI) diff += Math.PI * 2;
+    return a + diff * t;
+  }
+
+  function handleOrientation(evt) {
+    if (evt.beta === null || evt.gamma === null) return;
+    rawBeta = evt.beta;
+    rawGamma = evt.gamma;
+  }
+
+  // =========================================================================
+  // 4. PERMISSION HANDSHAKE (iOS 13+ requires a user gesture)
+  // =========================================================================
+  async function requestMotionPermission() {
+    if (typeof DeviceOrientationEvent !== 'undefined' &&
+        typeof DeviceOrientationEvent.requestPermission === 'function') {
+      // iOS Safari: MUST be called directly inside a user tap handler.
+      const result = await DeviceOrientationEvent.requestPermission();
+      if (result !== 'granted') {
+        throw new Error('Motion sensor permission was denied. The horizon lock cannot function without it.');
+      }
+    }
+    // Android / other browsers: no explicit permission step required.
+    window.addEventListener('deviceorientation', handleOrientation, true);
+  }
+
+  async function requestCameraAndMic() {
+    combinedStream = await navigator.mediaDevices.getUserMedia({
+      video: {
+        facingMode: { ideal: 'environment' },
+        width:  { ideal: 1920 },
+        height: { ideal: 1080 }
+      },
+      audio: true
+    });
+    video.srcObject = combinedStream;
+    audioTrack = combinedStream.getAudioTracks()[0] || null;
+    await video.play();
+  }
+
+  function fatalError(msg) {
+    errorMsg.textContent = msg;
+    console.error(msg);
+  }
+
+  startBtn.addEventListener('click', async function () {
+    startBtn.disabled = true;
+    errorMsg.textContent = '';
+    try {
+      await requestMotionPermission();
+      await requestCameraAndMic();
+      overlay.style.display = 'none';
+      requestAnimationFrame(renderLoop);
+    } catch (err) {
+      fatalError(err.message || 'Could not start camera.');
+      startBtn.disabled = false;
+    }
+  });
+
+  // =========================================================================
+  // 5. RENDER LOOP (WebGL @ up to 60fps)
+  // =========================================================================
+  function resizeCanvasToDisplaySize() {
+    const dpr = Math.min(window.devicePixelRatio || 1, 2); // cap for perf
+    const w = Math.round(window.innerWidth * dpr);
+    const h = Math.round(window.innerHeight * dpr);
+    if (canvas.width !== w || canvas.height !== h) {
+      canvas.width = w;
+      canvas.height = h;
+      gl.viewport(0, 0, w, h);
+    }
+  }
+
+  function renderLoop() {
+    resizeCanvasToDisplaySize();
+
+    if (video.readyState >= video.HAVE_CURRENT_DATA && video.videoWidth > 0) {
+      // Upload the current video frame straight into the GPU texture.
+      gl.bindTexture(gl.TEXTURE_2D, texture);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, video);
+
+      // Recompute + smooth the horizon-lock rotation every frame.
+      const target = computeTargetRoll();
+      smoothedRoll = lerpAngle(smoothedRoll, target, 0.18);
+
+      gl.uniform1f(uRotationLoc, smoothedRoll);
+      gl.uniform1f(uZoomLoc, ZOOM_FACTOR);
+      gl.uniform2f(uResolutionLoc, canvas.width, canvas.height);
+      gl.uniform1f(uVideoAspectLoc, video.videoWidth / video.videoHeight);
+
+      gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+
+      // HUD readout (degrees, 0.0 = perfectly level)
+      const deg = (-smoothedRoll * 180 / Math.PI);
+      tiltReadout.textContent = deg.toFixed(1) + '°';
+    }
+
+    requestAnimationFrame(renderLoop);
+  }
+
+  window.addEventListener('resize', resizeCanvasToDisplaySize);
+
+  // =========================================================================
+  // 6. LOCAL RECORDING ENGINE (MediaRecorder -> Web Share -> Files/iCloud)
+  // =========================================================================
+  function pickSupportedMimeType() {
+    const candidates = [
+      'video/mp4;codecs=avc1,mp4a.40.2', // Safari/iOS preferred (H.264/AAC)
+      'video/mp4',
+      'video/webm;codecs=vp9,opus',      // Chrome/Android preferred
+      'video/webm;codecs=vp8,opus',
+      'video/webm'
+    ];
+    for (const type of candidates) {
+      if (window.MediaRecorder && MediaRecorder.isTypeSupported(type)) {
+        return type;
+      }
+    }
+    return ''; // let the browser pick a default
+  }
+
+  function startRecording() {
+    if (!canvas.captureStream) {
+      fatalError('This browser does not support canvas.captureStream().');
+      return;
+    }
+
+    // Capture the *stabilized, rendered* canvas output at 30fps, then merge
+    // in the live microphone audio track from the original camera stream.
+    const canvasStream = canvas.captureStream(30);
+    if (audioTrack) {
+      canvasStream.addTrack(audioTrack);
+    }
+
+    const mimeType = pickSupportedMimeType();
+    recordedChunks = [];
+
+    try {
+      mediaRecorder = mimeType
+        ? new MediaRecorder(canvasStream, { mimeType, videoBitsPerSecond: 8_000_000 })
+        : new MediaRecorder(canvasStream);
+    } catch (err) {
+      fatalError('Could not start recorder: ' + err.message);
+      return;
+    }
+
+    mediaRecorder.ondataavailable = function (e) {
+      if (e.data && e.data.size > 0) recordedChunks.push(e.data);
+    };
+    mediaRecorder.onstop = handleRecordingStop;
+
+    mediaRecorder.start(1000); // gather data in 1s chunks
+    isRecording = true;
+    recStartTime = Date.now();
+    recordBtn.classList.add('recording');
+    recStatus.classList.add('show');
+    recTimerHandle = setInterval(updateRecTimer, 250);
+  }
+
+  function updateRecTimer() {
+    const elapsed = Math.floor((Date.now() - recStartTime) / 1000);
+    const mm = String(Math.floor(elapsed / 60)).padStart(2, '0');
+    const ss = String(elapsed % 60).padStart(2, '0');
+    recTimeEl.textContent = mm + ':' + ss;
+  }
+
+  function stopRecording() {
+    if (mediaRecorder && isRecording) {
+      mediaRecorder.stop();
+    }
+    isRecording = false;
+    recordBtn.classList.remove('recording');
+    recStatus.classList.remove('show');
+    clearInterval(recTimerHandle);
+  }
+
+  async function handleRecordingStop() {
+    const mimeType = mediaRecorder.mimeType || 'video/webm';
+    const ext = mimeType.includes('mp4') ? 'mp4' : 'webm';
+    const blob = new Blob(recordedChunks, { type: mimeType });
+    const filename = 'horizon-video-' + Date.now() + '.' + ext;
+    const file = new File([blob], filename, { type: mimeType });
+
+    // Preferred path: native Web Share sheet -> "Save to Files" / iCloud / etc.
+    // This keeps the entire flow 100% local — no server ever sees the file.
+    if (navigator.canShare && navigator.canShare({ files: [file] })) {
+      try {
+        await navigator.share({
+          files: [file],
+          title: 'Horizon Video',
+          text: 'Stabilized horizon-locked video'
+        });
+        return;
+      } catch (err) {
+        // User cancelled the share sheet, or share failed — fall through to download.
+        console.warn('Share cancelled/failed, falling back to download:', err);
+      }
+    }
+
+    // Fallback for browsers without file-sharing support: trigger a normal
+    // local download link (still entirely offline / on-device).
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setTimeout(() => URL.revokeObjectURL(url), 4000);
+  }
+
+  recordBtn.addEventListener('click', function () {
+    if (isRecording) {
+      stopRecording();
+    } else {
+      startRecording();
+    }
+  });
+
+})();
+</script>
+</body>
+</html>
