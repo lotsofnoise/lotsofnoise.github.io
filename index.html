@@ -9,7 +9,7 @@
 <link rel="manifest" href="manifest.json">
 <meta name="theme-color" content="#000000">
 
-<!-- iOS "Add to Home Screen" support -->
+<!-- iOS "Add to Home Screen" support (Safari ignores manifest.json for these) -->
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <meta name="apple-mobile-web-app-title" content="Horizon">
@@ -30,11 +30,11 @@
   /* Hidden <video> element — used purely as a WebGL texture source, never shown directly */
   #srcVideo { position:absolute; width:1px; height:1px; opacity:0; pointer-events:none; }
 
-  /* The visible output canvas */
+  /* The visible output — a FIXED landscape (16:9) frame, letterboxed on
+     portrait screens exactly like the real Horizon app's portrait view */
   #glCanvas {
     position:fixed; top:50%; left:50%;
     display:block; background:#000;
-    transform: translate(-50%, -50%);
     transform-origin:center center;
   }
 
@@ -124,7 +124,7 @@
     </div>
   </div>
 
-  <!-- Start / permission overlay -->
+  <!-- Start / permission-handshake overlay -->
   <div id="startOverlay">
     <h1>Horizon Level Camera</h1>
     <p>Locks the video to true horizontal, no matter how the phone is rotated. Tap below to grant camera, microphone, and motion sensor access.</p>
@@ -199,12 +199,6 @@
 
   let smoothedRoll = 0;
   let smoothedScale = 1;
-
-  // Track preview rotation & scaling variables to apply directly in WebGL
-  let targetPreviewRot = 0;
-  let currentPreviewRot = 0;
-  let targetPreviewScale = 1;
-  let currentPreviewScale = 1;
 
   let combinedStream = null;
   let audioTrack = null;
@@ -504,16 +498,8 @@
 
       smoothedScale += (targetScale - smoothedScale) * 0.25;
 
-      // Update preview orientation & scale interpolations directly into WebGL
-      currentPreviewRot += (targetPreviewRot - currentPreviewRot) * 0.15;
-      currentPreviewScale += (targetPreviewScale - currentPreviewScale) * 0.15;
-
-      // Combine base stabilization roll with display preview rotation
-      const effectiveRoll = smoothedRoll - currentPreviewRot;
-      const effectiveScale = smoothedScale * currentPreviewScale;
-
-      gl.uniform1f(uRotationLoc, effectiveRoll);
-      gl.uniform1f(uScaleLoc, effectiveScale);
+      gl.uniform1f(uRotationLoc, smoothedRoll);
+      gl.uniform1f(uScaleLoc, smoothedScale);
       gl.uniform1f(uSrcAspectLoc, srcAspect);
 
       gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
@@ -527,7 +513,9 @@
     requestAnimationFrame(renderLoop);
   }
 
-  // Preview state calculations
+  // =========================================================================
+  // PREVIEW ROTATION & FULLSCREEN FIT (DISPLAY ONLY)
+  // =========================================================================
   let previewQuadrant = 0;
   let previewCssRotation = 0;
   const PREVIEW_HYSTERESIS = 18;
@@ -541,18 +529,31 @@
     return { wUp: wUp, hUp: hUp, sideways: sideways };
   }
 
-  function applyPreview(rotDeg, scale) {
+  function applyPreview(rotDeg, scale, animate) {
     const f = previewFit();
     canvas.style.width  = f.wUp + 'px';
     canvas.style.height = f.hUp + 'px';
-    canvas.style.transform = 'translate(-50%, -50%)';
+    const end = 'translate(-50%,-50%) rotate(' + rotDeg + 'deg) scale(' + scale + ')';
 
-    targetPreviewRot = rotDeg * DEG2RAD;
-    targetPreviewScale = scale;
+    if (animate) {
+      const midScale = Math.max(scale, canvas._lastScale || 1) * 1.25;
+      const midRot = ((canvas._lastRot || 0) + rotDeg) / 2;
+      canvas.animate(
+        [
+          { transform: 'translate(-50%,-50%) rotate(' + (canvas._lastRot || 0) + 'deg) scale(' + (canvas._lastScale || 1) + ')' },
+          { transform: 'translate(-50%,-50%) rotate(' + midRot + 'deg) scale(' + midScale + ')', offset: 0.5 },
+          { transform: end }
+        ],
+        { duration: 420, easing: 'ease-in-out', fill: 'none' }
+      );
+    }
+    canvas.style.transform = end;
+    canvas._lastRot = rotDeg;
+    canvas._lastScale = scale;
   }
 
   function updatePreview() {
-    if (!fusedInit) { applyPreview(0, 1); return; }
+    if (!fusedInit) { applyPreview(0, 1, false); return; }
 
     const physical = fusedRoll * 180 / Math.PI;
     const rel = ((physical - previewQuadrant) % 360 + 540) % 360 - 180;
@@ -565,16 +566,16 @@
       previewQuadrant = q;
       const sideways = (q === 90 || q === 270);
       const f = previewFit();
-      applyPreview(previewCssRotation, sideways ? f.sideways : 1);
+      applyPreview(previewCssRotation, sideways ? f.sideways : 1, true);
     }
   }
 
   window.addEventListener('resize', function () {
     const sideways = (previewQuadrant === 90 || previewQuadrant === 270);
     const f = previewFit();
-    applyPreview(previewCssRotation, sideways ? f.sideways : 1);
+    applyPreview(previewCssRotation, sideways ? f.sideways : 1, false);
   });
-  applyPreview(0, 1);
+  applyPreview(0, 1, false);
 
   // =========================================================================
   // 6. RECORDING ENGINE
