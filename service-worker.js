@@ -5,7 +5,7 @@
 // requires the OS permission grant, but no network is needed for that.
 // ---------------------------------------------------------------------------
 
-const CACHE_NAME = 'horizon-camera-v2';
+const CACHE_NAME = 'horizon-camera-v4';
 const APP_SHELL = [
   './',
   './index.html',

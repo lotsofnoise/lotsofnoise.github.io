@@ -158,18 +158,46 @@
 
   const DEG2RAD = Math.PI / 180;
 
-  // Raw gravity vector components in device-local coordinates, updated by
-  // the devicemotion listener. x = left/right axis of the device,
-  // y = top/bottom axis of the device (per the DeviceMotion spec).
-  let rawGX = 0;
-  let rawGY = 0;
+  // Raw gravity vector components in device-local coordinates. These are
+  // LOW-PASS FILTERED (see handleMotion) to isolate steady gravity from the
+  // transient hand-motion acceleration that accelerationIncludingGravity also
+  // picks up — that contamination was the cause of the horizon jumping around
+  // when panning the camera.
+  let gravX = 0;
+  let gravY = 0;
+  let gravInit = false; // becomes true after the first sensor reading seeds the filter
 
-  // Flip this to -1 if the horizon rotates the WRONG direction on your
-  // specific device/browser (sign conventions for accelerationIncludingGravity
-  // have historically varied slightly across implementations). Test by
-  // tilting the phone clockwise — the video should visually counter-rotate
-  // to stay level. If it goes the wrong way, flip this constant.
+  // *** MAIN TUNING KNOB ***
+  // How much of each new sensor reading is blended in per event.
+  //   Lower  (e.g. 0.05) = steadier, more "locked/still" like the real app,
+  //                        but slower to catch up to fast rotation.
+  //   Higher (e.g. 0.25) = snappier response, but more jitter during motion.
+  // Start here and adjust to taste on your device.
+  const GRAVITY_SMOOTHING = 0.1;
+
+  // --- iOS GRAVITY SIGN FIX (critical) -------------------------------------
+  // iOS reports accelerationIncludingGravity with the OPPOSITE sign from
+  // Android / the DeviceMotion spec. Negating both x and y shifts the
+  // computed roll by 180° (atan2(-x,-y) = atan2(x,y) ± π) — which ROLL_SIGN
+  // cannot correct, since negating atan2's result mirrors the angle instead
+  // (-atan2(x,y) = atan2(-x,y)). Without this, iOS renders upside-down.
+  // The presence of requestPermission() is a reliable iOS 13+ marker.
+  const IS_IOS_MOTION = typeof DeviceMotionEvent !== 'undefined' &&
+                        typeof DeviceMotionEvent.requestPermission === 'function';
+  const GRAVITY_VECTOR_SIGN = IS_IOS_MOTION ? -1 : 1;
+
+  // Flip this to -1 ONLY if, after the iOS fix above, the horizon still
+  // counter-rotates in the wrong direction (i.e. the image visibly tilts
+  // WITH the phone). This corrects mirrored rotation direction; it cannot
+  // and should not be used to fix an upside-down image — that's what
+  // GRAVITY_VECTOR_SIGN above handles.
   const ROLL_SIGN = 1;
+
+  // Guards against registering the devicemotion listener more than once if
+  // the user retries the Start button after a partial failure (e.g. motion
+  // permission granted but camera denied). A duplicate listener would run
+  // the low-pass filter twice per event, silently doubling its speed.
+  let motionListenerAttached = false;
 
   // Smoothed rotation actually sent to the GPU (radians). Smoothing prevents
   // jittery, noisy sensor data from causing a shaky/flickering horizon.
@@ -344,25 +372,27 @@
   // continuous roll angle with no branch jumps or snapping, which is what
   // makes it flip-proof through a full 360° rotation.
   function getScreenAngleDeg() {
-    // Prefer the modern Screen Orientation API (Android Chrome, etc.)
+    // Prefer the modern Screen Orientation API (Android Chrome, and
+    // iOS Safari 16.4+, so this is the path virtually all modern devices take).
     if (screen.orientation && typeof screen.orientation.angle === 'number') {
       return screen.orientation.angle;
     }
-    // iOS Safari fallback (window.orientation is deprecated but still live there)
+    // Legacy fallback: window.orientation uses the OPPOSITE sign convention
+    // from screen.orientation.angle (e.g. -90 vs 270 for the same rotation),
+    // so normalize it into the modern convention before use.
     if (typeof window.orientation === 'number') {
-      return window.orientation;
+      return (360 - window.orientation) % 360;
     }
     return 0;
   }
 
   function computeTargetRoll() {
-    // Guard against the brief window before the first devicemotion event
-    // has fired (both components exactly 0 would otherwise give atan2(0,0)).
-    if (rawGX === 0 && rawGY === 0) return smoothedRoll;
+    // Hold steady until the filter has been seeded by the first real reading.
+    if (!gravInit) return smoothedRoll;
 
-    // atan2 of the gravity vector's screen-plane components. This alone is
-    // continuous through a full 360° rotation with no discontinuities.
-    let roll = Math.atan2(rawGX, rawGY) * ROLL_SIGN;
+    // atan2 of the (now filtered) gravity vector's screen-plane components.
+    // Continuous through a full 360° rotation with no discontinuities.
+    let roll = Math.atan2(gravX, gravY) * ROLL_SIGN;
 
     // Compensate for the physical screen rotation (portrait vs landscape,
     // and landscape-left vs landscape-right) so the correction is always
@@ -385,8 +415,26 @@
   function handleMotion(evt) {
     const g = evt.accelerationIncludingGravity;
     if (!g || g.x === null || g.y === null) return;
-    rawGX = g.x;
-    rawGY = g.y;
+
+    // Apply the platform sign correction at the source so all downstream
+    // math works in one consistent (spec/Android) convention.
+    const gx = g.x * GRAVITY_VECTOR_SIGN;
+    const gy = g.y * GRAVITY_VECTOR_SIGN;
+
+    // Seed the filter with the first real reading so it doesn't have to ramp
+    // up from zero (which would cause a visible swing on startup).
+    if (!gravInit) {
+      gravX = gx;
+      gravY = gy;
+      gravInit = true;
+      return;
+    }
+
+    // Low-pass filter: blend in only a fraction of each new reading. Steady
+    // gravity accumulates; brief motion spikes from panning/turning the
+    // camera average out to near-zero and never reach the horizon math.
+    gravX += (gx - gravX) * GRAVITY_SMOOTHING;
+    gravY += (gy - gravY) * GRAVITY_SMOOTHING;
   }
 
   // =========================================================================
@@ -404,7 +452,12 @@
       }
     }
     // Android / other browsers: no explicit permission step required.
-    window.addEventListener('devicemotion', handleMotion, true);
+    // Guarded so a Start-button retry (e.g. after a camera permission
+    // failure) can't attach a second listener and double-run the filter.
+    if (!motionListenerAttached) {
+      window.addEventListener('devicemotion', handleMotion, true);
+      motionListenerAttached = true;
+    }
   }
 
   async function requestCameraAndMic() {
@@ -444,6 +497,14 @@
   // 5. RENDER LOOP (WebGL @ up to 60fps)
   // =========================================================================
   function resizeCanvasToDisplaySize() {
+    // NEVER resize while recording: changing the canvas dimensions changes
+    // the captured stream's resolution mid-encode, which glitches or
+    // corrupts MediaRecorder output on several platforms. The canvas simply
+    // stays at its pre-recording size until the recording stops (the CSS
+    // stretch may look slightly off if the user rotates mid-recording, but
+    // the recorded file stays intact — the right tradeoff).
+    if (isRecording) return;
+
     const dpr = Math.min(window.devicePixelRatio || 1, 2); // cap for perf
     const w = Math.round(window.innerWidth * dpr);
     const h = Math.round(window.innerHeight * dpr);
@@ -462,9 +523,11 @@
       gl.bindTexture(gl.TEXTURE_2D, texture);
       gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, video);
 
-      // Recompute + smooth the horizon-lock rotation every frame.
+      // Recompute the horizon-lock rotation every frame. The heavy smoothing
+      // now happens on the gravity input (GRAVITY_SMOOTHING); this final lerp
+      // is light, just to smooth the RAF/sensor timing mismatch.
       const target = computeTargetRoll();
-      smoothedRoll = lerpAngle(smoothedRoll, target, 0.18);
+      smoothedRoll = lerpAngle(smoothedRoll, target, 0.5);
 
       gl.uniform1f(uRotationLoc, smoothedRoll);
       gl.uniform1f(uZoomLoc, ZOOM_FACTOR);
