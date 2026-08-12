@@ -181,6 +181,8 @@
   let gravX = 0;
   let gravY = 0;
   let gravInit = false; // becomes true after the first sensor reading seeds the filter
+  let restMag = 0;      // learned "1g" force magnitude (unit-agnostic baseline)
+  let restMagInit = false;
 
   // *** MAIN TUNING KNOB ***
   // How much of each new accelerometer reading is blended in per event.
@@ -487,6 +489,52 @@
     // all downstream math works in one consistent convention.
     const gx = g.x * gravitySign;
     const gy = g.y * gravitySign;
+    const hasZ = (g.z !== null && g.z !== undefined);
+    const gz = hasZ ? g.z : 0;
+
+    // --- MOTION REJECTION (the fix for shaking on tilt) ------------------
+    // A phone feeling only gravity reads a total force of ~9.81 m/s² (1g).
+    // When your hand adds motion, the total departs from 1g — and in that
+    // moment the sensed "down" is unreliable. So we weight how much we trust
+    // this reading by how close the force is to 1g: near 1g -> trust fully;
+    // far from 1g (active motion) -> trust little and hold the frame steady.
+    // Only valid when the full 3D force is available (needs z); otherwise the
+    // in-plane magnitude drops when you point up/down and would misfire, so we
+    // trust fully in that case.
+    let trust = 1;
+    if (hasZ) {
+      const mag = Math.sqrt(gx * gx + gy * gy + gz * gz);
+      // Learn the device's rest ("1g") magnitude the first time, so this works
+      // whether the browser reports m/s² (~9.81) or g (~1) — no unit guessing.
+      if (!restMagInit) { restMag = mag; restMagInit = true; }
+      const off = Math.abs(mag - restMag) / restMag;  // 0 = pure gravity
+      trust = Math.max(0.05, 1 - off * 3.0);           // 1 still … 0.05 moving
+      restMag += (mag - restMag) * 0.02 * trust;
+    }
+
+    // --- GYRO AS A MOTION DETECTOR (the flip-shake fix) ------------------
+    // The gyro measures rotation SPEED, which needs no sign to be useful. A
+    // flip is a fast rotation, and that's exactly when the accelerometer's
+    // "down" is most corrupted by hand motion. So when the phone is rotating
+    // fast, we drop trust and hold the frame steady instead of chasing the
+    // shaky reading; it settles to level the instant the flip stops. Using
+    // only the magnitude sidesteps the gyro-sign bug that caused drift-snap.
+    const rr = evt.rotationRate;
+    if (rr) {
+      const rotMag = Math.sqrt(
+        (rr.alpha || 0) * (rr.alpha || 0) +
+        (rr.beta  || 0) * (rr.beta  || 0) +
+        (rr.gamma || 0) * (rr.gamma || 0)
+      ); // deg/s
+      // Full trust up to ~40°/s (normal handling); ramp down to a near-freeze
+      // by ~240°/s (a flip). Raise the 40 for looser, lower for tighter.
+      if (rotMag > 40) {
+        const rotTrust = Math.max(0.05, 1 - (rotMag - 40) / 200);
+        trust = Math.min(trust, rotTrust);
+      }
+    }
+
+    const adaptiveGravity = GRAVITY_SMOOTHING * trust;
 
     // Seed the filter with the first real reading so it doesn't have to ramp
     // up from zero (which would cause a visible swing on startup).
@@ -497,9 +545,11 @@
       return;
     }
 
-    // Low-pass gravity filter (anchors the absolute level reference).
-    gravX += (gx - gravX) * GRAVITY_SMOOTHING;
-    gravY += (gy - gravY) * GRAVITY_SMOOTHING;
+    // Low-pass gravity filter, weighted by motion trust: when the phone is
+    // being moved, adaptiveGravity is tiny, so the level reference barely
+    // updates and the frame stays steady instead of shaking.
+    gravX += (gx - gravX) * adaptiveGravity;
+    gravY += (gy - gravY) * adaptiveGravity;
 
     // Accelerometer-derived roll, in the DEVICE frame (screen-rotation
     // compensation is applied later, at render time — the gyro measures
@@ -512,35 +562,11 @@
       prevARoll = aRoll;
       return;
     }
-
-    // Gyro rate about the screen normal (device z-axis) in deg/s.
-    const rr = evt.rotationRate;
-    const rate = (rr && rr.alpha !== null && rr.alpha !== undefined) ? rr.alpha : null;
-
-    // --- Gyro direction self-calibration --------------------------------
-    // Correlate gyro rate against the accelerometer roll velocity during
-    // clear rotation. Consistent agreement (or disagreement) over several
-    // samples fixes the integration sign for this device.
-    if (gyroSign === 0 && rate !== null && dt > 0 && prevARoll !== null) {
-      let dA = aRoll - prevARoll;
-      while (dA > Math.PI)  dA -= 2 * Math.PI;
-      while (dA < -Math.PI) dA += 2 * Math.PI;
-      const aVel = dA / dt; // rad/s from the accelerometer's perspective
-      if (Math.abs(rate) > 30 && Math.abs(aVel) > 0.25) {
-        gyroScore += Math.sign(rate) * Math.sign(aVel);
-        if (Math.abs(gyroScore) >= GYRO_SCORE_NEEDED) {
-          gyroSign = gyroScore > 0 ? 1 : -1;
-        }
-      }
-    }
     prevARoll = aRoll;
 
-    // Level PURELY from gravity (accelerometer). aRoll is an absolute
-    // measurement of "down" every frame, so it cannot drift-and-snap the way
-    // gyro integration can — that drift-then-snap-back on rolls was the gyro
-    // briefly pushing the wrong way before the accelerometer corrected it.
-    // The adaptive smoothing in the render loop keeps this steady when still
-    // and responsive when you actually roll, so we don't need the gyro.
+    // Level from gravity. During fast rotation the trust-weighted update above
+    // has already frozen gravX/gravY, so aRoll holds steady through a flip and
+    // settles to level the moment it ends — no shake, no gyro-sign drift-snap.
     fusedRoll = aRoll;
   }
 
