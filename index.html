@@ -401,38 +401,14 @@
   // always 1920x1080 landscape regardless of how the phone is held, and the
   // stream dimensions can't change mid-encode (which was corrupting/"morphing"
   // recordings when the old code resized the canvas with the screen).
-  // Output frame. It is now ORIENTATION-ADAPTIVE so portrait can fill a tall
-  // screen with no black bars and nothing cut off:
-  //   • physical LANDSCAPE -> wide 16:9 frame (unchanged; you said it's fine)
-  //   • physical PORTRAIT  -> tall frame matching the screen's shape, so it
-  //     fills top-to-bottom naturally (the recording is then a portrait video)
-  // The frame only changes between recordings — never mid-recording — so a clip
-  // can't morph partway through.
-  let OUT_ASPECT = 1920 / 1080;   // current output aspect (mutable)
-  let currentOutIsPortrait = false;
-
-  function setOutputAspect(aspect) {
-    OUT_ASPECT = aspect;
-    // Keep the short side ~1080 for quality without over-taxing the encoder.
-    let w, h;
-    if (aspect >= 1) { h = 1080; w = Math.round(h * aspect); }
-    else { w = 1080; h = Math.round(w / aspect); }
-    // Make both even (encoders prefer it).
-    w -= (w % 2); h -= (h % 2);
-    canvas.width = w;
-    canvas.height = h;
-    gl.viewport(0, 0, w, h);
-    gl.uniform1f(uOutAspectLoc, OUT_ASPECT);
-    lockedZoomAspect = 0; // force the zoom to recompute for the new frame shape
-  }
-
-  // Initialise to match how the app opens (portrait on a phone) so the very
-  // first frame already fills correctly.
-  setOutputAspect(
-    window.innerWidth < window.innerHeight
-      ? (window.innerWidth / window.innerHeight)
-      : (1920 / 1080)
-  );
+  // Drop to 1280x720 if an older device stutters while recording.
+  const OUT_WIDTH  = 1920;
+  const OUT_HEIGHT = 1080;
+  const OUT_ASPECT = OUT_WIDTH / OUT_HEIGHT;
+  canvas.width  = OUT_WIDTH;
+  canvas.height = OUT_HEIGHT;
+  gl.viewport(0, 0, OUT_WIDTH, OUT_HEIGHT);
+  gl.uniform1f(uOutAspectLoc, OUT_ASPECT);
 
   // =========================================================================
   // 3. INVERSION-SHIELD SENSOR MATH
@@ -754,17 +730,15 @@
   function previewFit() {
     const vw = window.innerWidth;
     const vh = window.innerHeight;
-    // Base size = the landscape frame fit to the viewport WIDTH.
+    // Base size = the landscape frame fit to the viewport WIDTH (letterbox in
+    // portrait — the look you already had at rest).
     const wUp = Math.min(vw, vh * OUT_ASPECT);
     const hUp = wUp / OUT_ASPECT;
-    // Sideways (landscape) fill: rotated frame fills using the long side.
+    // When shown sideways, scale so the (rotated) frame fills the screen using
+    // the viewport's long side — this is what produces the fullscreen-landscape
+    // look and the zoom-in relative to the portrait strip.
     const sideways = Math.max(vw / hUp, vh / wUp);
-    // Portrait fill. With the orientation-adaptive frame, in portrait the
-    // output frame already matches the screen shape, so this evaluates to
-    // ~1.0 — filling the screen with NO bars and nothing cut off. (If the
-    // frame is still 16:9 for any reason, this safely falls back to full-fill.)
-    const portrait = Math.max(vw / wUp, vh / hUp);
-    return { wUp: wUp, hUp: hUp, sideways: sideways, portrait: portrait };
+    return { wUp: wUp, hUp: hUp, sideways: sideways };
   }
 
   function applyPreview(rotDeg, scale, animate) {
@@ -792,7 +766,7 @@
   }
 
   function updatePreview() {
-    if (!fusedInit) { applyPreview(0, previewFit().portrait, false); return; }
+    if (!fusedInit) { applyPreview(0, 1, false); return; }
 
     // Physical roll of the phone (0 = upright portrait).
     const physical = fusedRoll * 180 / Math.PI;
@@ -802,34 +776,26 @@
 
     if (Math.abs(rel) > 45 + PREVIEW_HYSTERESIS) {
       const q = ((Math.round(physical / 90) * 90) % 360 + 360) % 360;
-      const sideways = (q === 90 || q === 270);
-
-      // Switch the OUTPUT FRAME to match orientation so portrait fills a tall
-      // screen with no bars/cutoff and landscape stays wide. Never switch mid
-      // recording (that would change the clip's dimensions partway through).
-      if (!isRecording) {
-        const desired = sideways ? (1920 / 1080)
-                                 : (window.innerWidth / window.innerHeight);
-        if (Math.abs(OUT_ASPECT - desired) > 0.01) setOutputAspect(desired);
-      }
-
       // Rotate the preview the SAME direction as the physical turn so the
-      // (already-upright) content stays upright to you in landscape.
+      // (already-upright) content stays upright to you in landscape. (This
+      // direction was flipped from -q, which showed landscape upside-down on
+      // device — a display-only sign; the recording is unaffected either way.)
       const targetCss = q;
       let delta = ((targetCss - previewCssRotation) % 360 + 540) % 360 - 180;
       previewCssRotation += delta;
       previewQuadrant = q;
+      const sideways = (q === 90 || q === 270);
       const f = previewFit();
-      applyPreview(previewCssRotation, sideways ? f.sideways : f.portrait, true);
+      applyPreview(previewCssRotation, sideways ? f.sideways : 1, true);
     }
   }
 
   window.addEventListener('resize', function () {
     const sideways = (previewQuadrant === 90 || previewQuadrant === 270);
     const f = previewFit();
-    applyPreview(previewCssRotation, sideways ? f.sideways : f.portrait, false);
+    applyPreview(previewCssRotation, sideways ? f.sideways : 1, false);
   });
-  applyPreview(0, previewFit().portrait, false);
+  applyPreview(0, 1, false);
 
   // =========================================================================
   // 6. LOCAL RECORDING ENGINE (MediaRecorder -> Web Share -> Files/iCloud)
