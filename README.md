@@ -1,5 +1,8 @@
 # StableCam
 
+<img src="https://github.com/lotsofnoise/lotsofnoise.github.io/blob/main/icons/sticker.png" width="200" alt="StableCam">
+
+
 https://lotsofnoise.github.io
 
 Look, folks. We live in a society. And apparently that society now requires a monthly subscription just to hold your phone sideways while you record your kid's dance recital or your dog refusing to come inside.
